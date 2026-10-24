@@ -21,7 +21,7 @@ open class SneakyDB : JavaPlugin() {
         executor = Executors.newFixedThreadPool(4) { task ->
             Thread(task, "SneakyDB-Query").apply { isDaemon = true }
         }
-        SneakyDBProvider.install(api)
+        SneakyDBRegistry.api = api
         val settings = DatabaseSettings(
             host = config.getString("database.host", "localhost")!!,
             port = config.getInt("database.port", 5432),
@@ -51,7 +51,7 @@ open class SneakyDB : JavaPlugin() {
 
     override fun onDisable() {
         stopping = true
-        SneakyDBProvider.clear()
+        SneakyDBRegistry.api = null
         if (::executor.isInitialized) {
             executor.shutdown()
             if (!executor.awaitTermination(2, TimeUnit.SECONDS)) executor.shutdownNow()
