@@ -1,0 +1,9 @@
+database:
+  adapter: postgresql
+  host: localhost
+  port: 5432
+  name: minecraft
+  username: minecraft
+  password: change-me
+  maximum-pool-size: 10
+  connection-timeout-ms: 5000

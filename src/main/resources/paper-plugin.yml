@@ -1,0 +1,7 @@
+name: SneakyDB
+version: '${version}'
+main: com.sneakydb.SneakyDB
+description: Shared asynchronous database API for Team-Sneakymouse plugins.
+api-version: '26.2'
+authors: [Team Sneakymouse]
+website: https://github.com/Team-Sneakymouse/SneakyDB
