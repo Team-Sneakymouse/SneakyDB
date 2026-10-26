@@ -2,26 +2,32 @@ package com.sneakydb
 
 import com.sneakydb.adapter.DatabaseSettings
 import com.sneakydb.adapter.PostgreSqlAdapter
-import com.zaxxer.hikari.HikariDataSource
 import org.bukkit.plugin.java.JavaPlugin
-import java.sql.ResultSet
-import java.util.concurrent.CompletableFuture
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
+internal fun logReadinessFailure(logger: java.util.logging.Logger, failure: Throwable) {
+    var diagnostic = failure
+    while (diagnostic is java.util.concurrent.CompletionException && diagnostic.cause != null) {
+        diagnostic = diagnostic.cause!!
+    }
+    val knownMessages = listOf("adapter creation", "connection acquisition", "connection validation").map {
+        "SneakyDB initialization failed during $it; check adapter configuration and database access"
+    }
+    val message = diagnostic.message
+    if (diagnostic is IllegalStateException && message in knownMessages) {
+        logger.severe(message)
+    } else if (diagnostic !is IllegalStateException || message != "SneakyDB has shut down") {
+        logger.severe("SneakyDB initialization failed; check database configuration and access.")
+    }
+}
+
 open class SneakyDB : JavaPlugin() {
-    private lateinit var executor: ExecutorService
-    @Volatile private var dataSource: HikariDataSource? = null
-    @Volatile private var stopping = false
-    private val api = DatabaseApi()
+    private var session: DatabaseSession? = null
 
     override fun onEnable() {
         saveDefaultConfig()
-        executor = Executors.newFixedThreadPool(4) { task ->
-            Thread(task, "SneakyDB-Query").apply { isDaemon = true }
-        }
-        SneakyDBRegistry.api = api
         val settings = DatabaseSettings(
             host = config.getString("database.host", "localhost")!!,
             port = config.getInt("database.port", 5432),
@@ -32,78 +38,26 @@ open class SneakyDB : JavaPlugin() {
             connectionTimeoutMs = config.getLong("database.connection-timeout-ms", 5000).coerceIn(250, 30000),
         )
         val adapterId = config.getString("database.adapter", "postgresql")!!.lowercase()
-        executor.execute {
-            try {
-                val adapter = when (adapterId) {
-                    "postgresql" -> PostgreSqlAdapter()
-                    else -> throw IllegalArgumentException("Unknown database adapter '$adapterId'")
-                }
-                val source = adapter.createDataSource(settings)
-                if (stopping) source.close() else {
-                    dataSource = source
-                    logger.info("PostgreSQL adapter connected and ready.")
-                }
-            } catch (failure: Exception) {
-                logger.severe("Unable to initialize PostgreSQL adapter (${failure.javaClass.simpleName}).")
-            }
+        val executor = ThreadPoolExecutor(
+            4, 4, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(256),
+            { task -> Thread(task, "SneakyDB-Worker").apply { isDaemon = true } },
+            ThreadPoolExecutor.AbortPolicy(),
+        )
+        val generation = DatabaseSession(executor) {
+            require(adapterId == "postgresql") { "Unsupported database adapter" }
+            PostgreSqlAdapter().createDataSource(settings)
+        }
+        session = generation
+        SneakyDBRegistry.api = generation
+        generation.whenReady().whenComplete { _, failure ->
+            if (failure != null) logReadinessFailure(logger, failure)
+            else if (generation.isAvailable()) logger.info("PostgreSQL adapter connected and ready.")
         }
     }
 
     override fun onDisable() {
-        stopping = true
         SneakyDBRegistry.api = null
-        if (::executor.isInitialized) {
-            executor.shutdown()
-            if (!executor.awaitTermination(2, TimeUnit.SECONDS)) executor.shutdownNow()
-        }
-        dataSource?.close()
-    }
-
-    private inner class DatabaseApi : SneakyDBApi {
-        override fun isAvailable(): Boolean = dataSource?.isClosed == false
-
-        override fun query(sql: String, parameters: List<*>): CompletableFuture<List<Map<String, Any?>>> =
-            submit { source ->
-                source.connection.use { connection ->
-                    connection.prepareStatement(sql).use { statement ->
-                        bind(statement, parameters)
-                        statement.executeQuery().use { result -> result.toRows() }
-                    }
-                }
-            }
-
-        override fun execute(sql: String, parameters: List<*>): CompletableFuture<Int> =
-            submit { source ->
-                source.connection.use { connection ->
-                    connection.prepareStatement(sql).use { statement ->
-                        bind(statement, parameters)
-                        statement.executeUpdate()
-                    }
-                }
-            }
-
-        private fun <T> submit(operation: (HikariDataSource) -> T): CompletableFuture<T> =
-            CompletableFuture.supplyAsync({
-                val source = dataSource ?: throw IllegalStateException("SneakyDB database adapter is not available")
-                if (source.isClosed) throw IllegalStateException("SneakyDB database adapter is closed")
-                operation(source)
-            }, executor)
-    }
-
-    private fun bind(statement: java.sql.PreparedStatement, parameters: List<*>) {
-        parameters.forEachIndexed { index, value -> statement.setObject(index + 1, value) }
-    }
-
-    private fun ResultSet.toRows(): List<Map<String, Any?>> {
-        val metadata = metaData
-        val rows = ArrayList<Map<String, Any?>>()
-        while (next()) {
-            val row = LinkedHashMap<String, Any?>(metadata.columnCount)
-            for (column in 1..metadata.columnCount) {
-                row[metadata.getColumnLabel(column)] = getObject(column)
-            }
-            rows.add(java.util.Collections.unmodifiableMap(row))
-        }
-        return java.util.Collections.unmodifiableList(rows)
+        session?.close()
+        session = null
     }
 }

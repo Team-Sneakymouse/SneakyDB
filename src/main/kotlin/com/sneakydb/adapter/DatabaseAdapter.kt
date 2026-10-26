@@ -30,5 +30,9 @@ class PostgreSqlAdapter : DatabaseAdapter {
         maximumPoolSize = settings.maximumPoolSize
         connectionTimeout = settings.connectionTimeoutMs
         initializationFailTimeout = settings.connectionTimeoutMs
+        // Bound the driver's initial network/login attempt as well as Hikari acquisition.
+        val timeoutSeconds = ((settings.connectionTimeoutMs + 999) / 1000).coerceAtLeast(1).toString()
+        addDataSourceProperty("connectTimeout", timeoutSeconds)
+        addDataSourceProperty("loginTimeout", timeoutSeconds)
     }
 }
