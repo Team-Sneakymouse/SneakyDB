@@ -82,7 +82,9 @@ internal class DatabaseSession(
         }
         try {
             executor.execute {
-                if (result.isDone) return@execute
+                // Claim work atomically with shutdown; JDBC runs outside the lifecycle lock.
+                val admitted = synchronized(lock) { !stopped && !result.isDone }
+                if (!admitted) return@execute
                 try { result.complete(operation(selected)) }
                 catch (error: Exception) { result.completeExceptionally(error) }
             }

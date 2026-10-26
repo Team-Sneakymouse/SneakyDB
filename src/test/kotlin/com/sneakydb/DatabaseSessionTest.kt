@@ -243,6 +243,22 @@ class DatabaseSessionTest {
         current.close()
     }
 
+    @Test fun `shutdown callbacks cannot admit other queued operations`() {
+        val worker = Worker()
+        val pool = Pool()
+        val session = DatabaseSession(worker) { pool }
+        worker.runNext()
+        val first = session.execute("DELETE FROM example", emptyList<Any>())
+        val second = session.query("SELECT * FROM example", emptyList<Any>())
+        val drain = { while (worker.tasks.isNotEmpty()) worker.runNext() }
+        first.whenComplete { _, _ -> drain() }
+        second.whenComplete { _, _ -> drain() }
+        session.close()
+        assertEquals(1, pool.acquired, "Shutdown must prevent queued operations acquiring connections")
+        assertTrue(first.isCompletedExceptionally)
+        assertTrue(second.isCompletedExceptionally)
+    }
+
     @Test fun `shutdown settles queued operations without running database work`() {
         val worker = Worker()
         val session = DatabaseSession(worker) { Pool() }
