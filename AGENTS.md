@@ -24,3 +24,11 @@ This repository is a Paper plugin and consumer API for a shared database bridge.
 - Builds derive versions from Git and require a checkout with at least one commit.
 
 Do not commit credentials. Database passwords belong in the server config or secret injection, not source control.
+
+## Repo-specific rules
+
+- Keep `SneakyDBApi`/`SneakyDBProvider` to JDK types only (`List`, `Map`, `CompletableFuture`). Add overloads rather than changing signatures, and grep consumer repos (SneakyJobBoard, SneakyPrototypeKit, LoMPhoneBridge) first.
+- Keep the readiness contract (README "Readiness and lifecycle contract"): `whenReady()` returns a defensive copy per call (`ready.copy()`), succeeds only after a validated connection, and fails on init failure or shutdown. Update `ReadinessLoggingTest`/`DatabaseSessionTest` and the README when touching it.
+- Failures surfaced through futures and logs must be credential-safe: wrap driver exceptions in a generic `IllegalStateException`; never log the password or a JDBC URL with credentials.
+- `sneakydb-api` and `sneakydb` publish separately. Consumers use a version-pinned `compileOnly` dependency, so bump consumers deliberately after an API change.
+- Run or add a disable/enable test when changing `DatabaseSession`; the worker executor and Hikari pool must shut down on disable.
