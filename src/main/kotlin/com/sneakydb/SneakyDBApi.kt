@@ -8,6 +8,9 @@ import kotlin.jvm.JvmSuppressWildcards
  * Operations fail via their returned futures while initialization is pending, after failure,
  * after shutdown, or when worker capacity is exhausted. They never wait for readiness.
  * Completion callbacks may run inline; do not block them or access Bukkit state without rescheduling.
+ *
+ * Keep signatures to JDK types only (no Kotlin, Paper, JDBC or Hikari types) and add overloads rather than changing them;
+ * consumers (SneakyJobBoard, SneakyPrototypeKit, LoMPhoneBridge) pin a version with compileOnly, so grep them first.
  */
 interface SneakyDBApi {
     /** Executes a query and returns each row as a column-label/value map. */

@@ -4,7 +4,11 @@ import com.zaxxer.hikari.HikariDataSource
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutorService
 
-/** A single enable generation, never reused after shutdown. */
+/**
+ * A single enable generation, never reused after shutdown. Errors reaching futures or logs must be credential-safe:
+ * wrap driver exceptions in a generic IllegalStateException, never log the password or a JDBC URL with credentials.
+ * The worker executor and Hikari pool must shut down on disable.
+ */
 internal class DatabaseSession(
     private val executor: ExecutorService,
     createSource: () -> HikariDataSource,
