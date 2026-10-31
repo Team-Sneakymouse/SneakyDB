@@ -115,6 +115,24 @@ database:
 
 Set credentials for your server before enabling the plugin. Database connection and query work runs on SneakyDB's worker threads. The PostgreSQL driver and connection pool are bundled in the server jar.
 
+## Database-outage maintenance fallback
+
+Startup initialization failure, or the first unsuccessful background connectivity check after successful initialization, requests **`cmi maintenance true <message>`** on the server thread. This is an explicit enable, never the argument-free toggle. The command contract comes from [CMI's official command reference](https://www.zrips.net/cmi/commands/) (`maintenance (true/false) (message)`, bypass permission `cmi.command.maintenance.bypass`). CMI owns player admission, bypass rules, message formatting, and any effects on already-connected players.
+
+```yaml
+maintenance:
+  message: 'Database unavailable. Please try again later.'
+  health-check-interval-seconds: 30
+```
+
+The message applies to both startup and runtime outages. Blank, control-character-containing, or over-512-character messages use the shown default. The interval is clamped to 5–300 seconds and is a delay **after** a completed check; the first check starts immediately after readiness. Config is read on enable; restart or disable/re-enable to apply edits (no hot reload command).
+
+Health checks use a dedicated single-thread scheduler and a separate one-connection PostgreSQL pool, not the consumer worker queue or consumer pool. Allow **one additional database connection** beyond `database.maximum-pool-size`. Acquisition, driver connect/login/socket waits, and `Connection.isValid(5)` validation have five-second bounds; these are individual JDBC/driver bounds, not a hard end-to-end deadline. Checks do not overlap or accumulate, and shutdown fences queued main-thread effects and closes health resources off-thread. Consumer SQL syntax/constraint errors, worker rejection, and consumer pool contention alone do not activate maintenance.
+
+**No automatic reopening:** only one maintenance command is attempted per enable generation, including across recovery and subsequent outages. Neither recovery nor disable/re-enable sends `false` or a toggle, so existing administrator maintenance stays enabled; an outage may replace its player-facing message. Operators must verify the database and manually reopen using CMI after recovery. A failed initial startup remains terminal: the health loop does not retry initialization. Fix configuration/access and restart or disable/re-enable first. The Java consumer API, historical `whenReady()`, and lifecycle-only `isAvailable()` semantics are unchanged.
+
+**CMI limitation:** CMI is an optional, ordered server dependency, accessed by command without a joined classpath. If CMI is missing/disabled, or dispatch fails, SneakyDB emits a credential-safe severe diagnostic and does not claim the server is protected. There is **no independent login/kick guard**, no automatic command retry, and no proof of admission policy from Bukkit's command-dispatch boolean. Installing/enabling CMI later requires a new SneakyDB enable generation or manual maintenance activation. Ensure CMI maintenance is available and correctly configured before relying on this fallback; close access manually if it is unavailable. This integration is unit/MockBukkit verified, not a live CMI-server test.
+
 ## Adapter design
 
 Adapters are selected and constructed inside SneakyDB. Each adapter supplies a pooled JDBC data source; consumers continue to call `query` and `execute` without depending on that adapter. Adding another database means adding its driver and adapter implementation, and registering its adapter identifier. SQL stays portable only to the extent that the caller writes portable SQL.

@@ -5,3 +5,9 @@ description: Shared asynchronous database API for Team-Sneakymouse plugins.
 api-version: '26.2'
 authors: [Team Sneakymouse]
 website: https://github.com/Team-Sneakymouse/SneakyDB
+dependencies:
+  server:
+    CMI:
+      load: BEFORE
+      required: false
+      join-classpath: false
