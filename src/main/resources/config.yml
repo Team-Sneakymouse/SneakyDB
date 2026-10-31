@@ -7,3 +7,10 @@ database:
   password: change-me
   maximum-pool-size: 10
   connection-timeout-ms: 5000
+
+maintenance:
+  # One explicit CMI enable per plugin generation; NEVER automatically reopens.
+  # Nonblank single line, maximum 512 characters; invalid values use the default.
+  message: 'Database unavailable. Please try again later.'
+  # Delay after each completed check; clamped to 5–300 seconds.
+  health-check-interval-seconds: 30
