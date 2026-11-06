@@ -72,11 +72,16 @@ internal class NotificationWorker(
     }
 
     private fun run() {
-        while (!closed) {
-            val wait = tick()
-            if (wait > 0) try { Thread.sleep(wait) } catch (_: InterruptedException) { /* closing */ }
+        try {
+            while (!closed) {
+                val wait = tick()
+                if (wait > 0) try { Thread.sleep(wait) } catch (_: InterruptedException) { /* closing */ }
+            }
+        } finally {
+            // Also when an Error ends the loop: close the connection and let the next subscription start a new thread.
+            closeConnection()
+            synchronized(lock) { if (!closed) { started = false; thread = null } }
         }
-        closeConnection()
     }
 
     /** Runs one step and returns how long to wait before the next one. */
@@ -120,13 +125,21 @@ internal class NotificationWorker(
 
     private fun dispatch(channel: String, payload: String) {
         for (subscription in subscriptions) {
-            if (subscription.channel != channel || subscription.closed) continue
+            // Only after its onConnected on this connection: its first re-read comes before any notification.
+            if (subscription.channel != channel || subscription.closed || subscription.announced != generation) continue
             guard(channel) { subscription.onNotification.accept(payload) }
         }
     }
 
+    /** Contains everything a callback throws (AssertionError and NoClassDefFoundError included) except VM errors. */
     private fun guard(channel: String, callback: () -> Unit) {
-        try { callback() } catch (_: Exception) { warn("SneakyDB notification listener for channel $channel failed") }
+        try {
+            callback()
+        } catch (error: VirtualMachineError) {
+            throw error
+        } catch (_: Throwable) {
+            warn("SneakyDB notification listener for channel $channel failed")
+        }
     }
 
     private fun closeConnection() {

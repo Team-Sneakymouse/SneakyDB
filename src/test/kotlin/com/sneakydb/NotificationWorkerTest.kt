@@ -10,6 +10,7 @@ class NotificationWorkerTest {
         val unlistened = mutableListOf<String>()
         val pending = ArrayDeque<Pair<String, String>>()
         var failPoll = false
+        var failPollWith: Throwable? = null
         var valid = true
         var closed = false
         var checks = 0
@@ -17,6 +18,7 @@ class NotificationWorkerTest {
         override fun listen(channel: String) { listened.add(channel); onListen(channel) }
         override fun unlisten(channel: String) { unlistened.add(channel) }
         override fun poll(timeoutMs: Int): List<Pair<String, String>> {
+            failPollWith?.let { throw it }
             if (failPoll) throw java.sql.SQLException("secret driver detail")
             return pending.toList().also { pending.clear() }
         }
@@ -81,6 +83,47 @@ class NotificationWorkerTest {
         worker.tick()
         assertTrue("late" in connections.single().listened)
         assertEquals(1, lateConnected)
+    }
+
+    @Test fun `a subscription gets no notification before its first onConnected`() {
+        val events = mutableListOf<String>()
+        subscribe("pushes", { if (it == "1") subscribe("pushes", { p -> events.add("notified $p") }, { events.add("connected") }) })
+        worker.tick()
+        connections.single().pending.addAll(listOf("pushes" to "1", "pushes" to "2"))
+        worker.tick()
+        connections.single().pending.add("pushes" to "3")
+        worker.tick()
+        assertEquals(listOf("connected", "notified 3"), events)
+    }
+
+    @Test fun `callback errors such as AssertionError are contained`() {
+        val delivered = mutableListOf<String>()
+        subscribe("pushes", { throw AssertionError("secret") }, { throw NoClassDefFoundError("secret") })
+        subscribe("pushes", { delivered.add(it) })
+        worker.tick()
+        connections.single().pending.add("pushes" to "1")
+        worker.tick()
+        assertEquals(listOf("1"), delivered)
+        assertEquals(2, warnings.size)
+        assertTrue(warnings.none { "secret" in it })
+    }
+
+    @Test fun `a loop ended by a VM error closes its connection and the next subscription starts a new one`() {
+        var loop: Runnable? = null
+        val errors = NotificationWorker(
+            open = { FakeConnection().also { connections.add(it) } },
+            warn = { warnings.add(it) },
+            startThread = { loop = it; threadStarts++; null },
+        )
+        errors.subscribe("pushes", Consumer {}, Runnable {})
+        // The first tick opens the connection; then its poll fails with an Error the loop doesn't catch.
+        errors.tick()
+        connections.single().failPollWith = StackOverflowError()
+        assertThrows(StackOverflowError::class.java) { loop!!.run() }
+        assertTrue(connections.single().closed)
+        errors.subscribe("other", Consumer {}, Runnable {})
+        assertEquals(2, threadStarts)
+        errors.close()
     }
 
     @Test fun `a later subscription is listened and announced on the open connection`() {
