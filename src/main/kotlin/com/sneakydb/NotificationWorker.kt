@@ -18,6 +18,9 @@ internal interface NotificationConnection : AutoCloseable {
 /** Lower-case PostgreSQL identifiers only, so they can be quoted into LISTEN without escaping. */
 internal val CHANNEL_NAME = Regex("[a-z_][a-z0-9_]{0,62}")
 
+/** SQLSTATE codes are five letters or digits; anything else isn't logged. */
+private val SQL_STATE = Regex("[0-9A-Z]{5}")
+
 /**
  * Owns the one notification connection and every subscription of an enable generation.
  * The connection opens with the first subscription and reconnects with backoff after a failure.
@@ -89,8 +92,8 @@ internal class NotificationWorker(
         if (closed) return 0
         val current = connection ?: try {
             open().also { connection = it; generation++; listened.clear(); lastCheck = clock() }
-        } catch (_: Exception) {
-            return fail("SneakyDB notification connection failed; retrying")
+        } catch (error: Exception) {
+            return fail("SneakyDB notification connection failed; retrying", error)
         }
         return try {
             sync(current)
@@ -98,14 +101,14 @@ internal class NotificationWorker(
             if (clock() - lastCheck >= keepAliveMs) { current.check(); lastCheck = clock() }
             failures = 0
             0
-        } catch (_: Exception) {
+        } catch (error: Exception) {
             closeConnection()
-            fail("SneakyDB notification connection lost; reconnecting")
+            fail("SneakyDB notification connection lost; reconnecting", error)
         }
     }
 
-    private fun fail(message: String): Long {
-        if (failures == 0) warn(message)
+    private fun fail(message: String, error: Throwable): Long {
+        if (failures == 0) warn("$message (${describe(error)})")
         return (1000L shl failures.coerceAtMost(5)).coerceAtMost(30_000).also { failures++ }
     }
 
@@ -137,9 +140,15 @@ internal class NotificationWorker(
             callback()
         } catch (error: VirtualMachineError) {
             throw error
-        } catch (_: Throwable) {
-            warn("SneakyDB notification listener for channel $channel failed")
+        } catch (error: Throwable) {
+            warn("SneakyDB notification listener for channel $channel failed (${describe(error)})")
         }
+    }
+
+    /** What failed, without any message text, which can hold credentials or private data. */
+    internal fun describe(error: Throwable): String {
+        val state = (error as? java.sql.SQLException)?.sqlState?.takeIf { SQL_STATE.matches(it) }
+        return if (state != null) "${error.javaClass.simpleName}, SQL state $state" else error.javaClass.simpleName
     }
 
     private fun closeConnection() {

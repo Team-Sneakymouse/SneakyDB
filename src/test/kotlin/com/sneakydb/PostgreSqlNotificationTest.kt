@@ -45,7 +45,8 @@ class PostgreSqlNotificationTest {
 
             sql("select pg_terminate_backend(pid) from pg_stat_activity where application_name = 'SneakyDB-Notifications'")
             assertNotNull(connects.poll(15, TimeUnit.SECONDS), "reconnect")
-            assertEquals("SneakyDB notification connection lost; reconnecting", warnings.poll(1, TimeUnit.SECONDS))
+            val lost = warnings.poll(1, TimeUnit.SECONDS)!!
+            assertTrue(lost.startsWith("SneakyDB notification connection lost; reconnecting (") && "SQL state" in lost, lost)
             sql("select pg_notify('sneakydb_test', 'two')")
             assertEquals("two", payloads.poll(10, TimeUnit.SECONDS))
         } finally {

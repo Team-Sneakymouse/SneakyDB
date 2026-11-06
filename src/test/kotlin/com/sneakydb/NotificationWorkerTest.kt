@@ -150,7 +150,7 @@ class NotificationWorkerTest {
         assertEquals(0, worker.tick())
         assertEquals(listOf(1, 2), connected)
         assertEquals(listOf("pushes"), connections[1].listened)
-        assertEquals(listOf("SneakyDB notification connection lost; reconnecting"), warnings)
+        assertEquals(listOf("SneakyDB notification connection lost; reconnecting (SQLException)"), warnings)
         // Recovery resets the backoff and the one warning per outage.
         connections[1].failPoll = true
         assertEquals(1000, worker.tick())
@@ -161,7 +161,7 @@ class NotificationWorkerTest {
         openFails = true
         subscribe("pushes")
         assertEquals(listOf(1000L, 2000, 4000, 8000, 16000, 30000, 30000, 30000), (1..8).map { worker.tick() })
-        assertEquals(listOf("SneakyDB notification connection failed; retrying"), warnings)
+        assertEquals(listOf("SneakyDB notification connection failed; retrying (IllegalStateException)"), warnings)
     }
 
     @Test fun `unsubscribing the last listener of a channel unlistens it`() {
@@ -208,7 +208,13 @@ class NotificationWorkerTest {
         connections.single().pending.add("pushes" to "1")
         worker.tick()
         assertEquals(listOf("1"), delivered)
-        assertEquals(listOf("SneakyDB notification listener for channel pushes failed"), warnings)
+        assertEquals(listOf("SneakyDB notification listener for channel pushes failed (IllegalStateException)"), warnings)
+    }
+
+    @Test fun `diagnostics name the error and its SQL state but never its message`() {
+        assertEquals("SQLException, SQL state 28P01", worker.describe(java.sql.SQLException("password=secret", "28P01")))
+        assertEquals("SQLException", worker.describe(java.sql.SQLException("password=secret", "password=secret")))
+        assertEquals("IllegalStateException", worker.describe(IllegalStateException("password=secret")))
     }
 
     @Test fun `rejects channel names that would need quoting`() {
