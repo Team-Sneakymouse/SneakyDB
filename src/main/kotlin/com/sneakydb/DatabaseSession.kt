@@ -11,6 +11,7 @@ import java.util.concurrent.ExecutorService
  */
 internal class DatabaseSession(
     private val executor: ExecutorService,
+    private val notifications: NotificationWorker? = null,
     createSource: () -> HikariDataSource,
 ) : SneakyDBApi {
     private val lock = Any()
@@ -46,6 +47,15 @@ internal class DatabaseSession(
 
     override fun whenReady(): CompletableFuture<Void> = ready.copy()
     override fun isAvailable(): Boolean = synchronized(lock) { source != null && !stopped }
+
+    override fun listen(channel: String, onNotification: java.util.function.Consumer<String>, onConnected: Runnable): AutoCloseable {
+        synchronized(lock) {
+            failure?.let { throw it }
+            check(!stopped) { "SneakyDB has shut down" }
+        }
+        val worker = notifications ?: throw UnsupportedOperationException("This SneakyDB adapter does not support notifications")
+        return worker.subscribe(channel, onNotification, onConnected)
+    }
 
     override fun query(sql: String, parameters: List<*>): CompletableFuture<List<Map<String, Any?>>> = submit { pool ->
         pool.connection.use { connection ->
@@ -107,6 +117,7 @@ internal class DatabaseSession(
         ready.completeExceptionally(error)
         pending.forEach { it.completeExceptionally(error) }
         executor.shutdownNow()
+        notifications?.close()
         closing?.let { pool -> Thread({ pool.close() }, "SneakyDB-Close").apply { isDaemon = true }.start() }
     }
 }

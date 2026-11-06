@@ -32,4 +32,21 @@ interface SneakyDBApi {
 
     /** True after successful initialization until shutdown; not a health probe. */
     fun isAvailable(): Boolean
+
+    /** Same as the three-argument [listen] without a connected callback. */
+    fun listen(channel: String, onNotification: java.util.function.Consumer<String>): AutoCloseable =
+        listen(channel, onNotification) {}
+
+    /**
+     * Subscribes to database notifications (PostgreSQL `LISTEN`; send with `NOTIFY` or `pg_notify`).
+     * [channel] must be a lower-case identifier (`[a-z_][a-z0-9_]{0,62}`). Callbacks run on SneakyDB's
+     * notification thread: keep them short and reschedule before touching Bukkit state.
+     *
+     * Notifications sent while the connection is down are lost. [onConnected] runs each time this
+     * subscription starts listening, including after a reconnect, so re-read the state you track there.
+     * Close the result to unsubscribe. Calls before readiness are fine; throws IllegalStateException after
+     * initialization failure or shutdown. Shutdown ends every subscription.
+     */
+    fun listen(channel: String, onNotification: java.util.function.Consumer<String>, onConnected: Runnable): AutoCloseable =
+        throw UnsupportedOperationException("This SneakyDB API does not support notifications")
 }

@@ -311,6 +311,8 @@ publishing {
                 archiveClassifier.set("")
                 from(sourceSets.main.get().output) {
                     include("com/sneakydb/SneakyDBApi.class")
+                    // Kotlin may emit DefaultImpls for the interface default methods.
+                    include("com/sneakydb/SneakyDBApi\$*.class")
                     include("com/sneakydb/SneakyDBProvider.class")
                 }
             })

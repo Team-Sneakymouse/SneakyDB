@@ -287,4 +287,26 @@ class DatabaseSessionTest {
         assertTrue(pool.timeout in 1..10)
         assertTrue(pool.connectionClosed)
     }
+
+    private fun notifications() = NotificationWorker({ NotificationWorkerTest.FakeConnection() }, {}, startThread = { null })
+
+    @Test fun `listen is allowed before readiness and refused after initialization failure or shutdown`() {
+        val worker = Worker()
+        val session = DatabaseSession(worker, notifications()) { Pool() }
+        assertDoesNotThrow { session.listen("pushes", java.util.function.Consumer {}).close() }
+        worker.runNext()
+        session.close()
+        assertThrows(IllegalStateException::class.java) { session.listen("pushes", java.util.function.Consumer {}) }
+
+        val failing = Worker()
+        val failed = DatabaseSession(failing, notifications()) { throw IllegalArgumentException("private") }
+        failing.runNext()
+        val error = assertThrows(IllegalStateException::class.java) { failed.listen("pushes", java.util.function.Consumer {}) }
+        assertFalse(error.message!!.contains("private"))
+    }
+
+    @Test fun `listen without a notification worker is unsupported`() {
+        val session = DatabaseSession(Worker()) { Pool() }
+        assertThrows(UnsupportedOperationException::class.java) { session.listen("pushes", java.util.function.Consumer {}) }
+    }
 }
