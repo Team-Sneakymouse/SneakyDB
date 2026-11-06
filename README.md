@@ -97,6 +97,24 @@ dependencies { compileOnly("io.github.team-sneakymouse:sneakydb-api:<version>") 
 
 Install the matching `SneakyDB-<version>.jar` on the server. Do not shade API classes into consumer plugins.
 
+## Notifications (LISTEN / NOTIFY)
+
+`listen(channel, onNotification, onConnected)` subscribes to PostgreSQL notifications; send them with `NOTIFY channel, 'payload'` or `pg_notify('channel', 'payload')`, for example from a trigger. Close the returned `AutoCloseable` to unsubscribe.
+
+```kotlin
+// Subscribe once queries work: onConnected re-reads with query(), which fails before readiness.
+database.whenReady().thenRun {
+    subscription = database.listen("discord_push_tracking", { payload -> refresh(payload) }) { refreshAll() }
+}
+```
+
+- Channel names are lower-case identifiers (`[a-z_][a-z0-9_]{0,62}`); anything else throws `IllegalArgumentException`.
+- Callbacks run on the single `SneakyDB-Notifications` thread, one at a time. Keep them short, and schedule onto the server thread before touching Bukkit state. A callback that throws is logged with its channel and the error's class, never its message, and does not affect other subscriptions. Connection warnings likewise name the error's class and SQL state only.
+- Notifications are not queued while the connection is down. `onConnected` runs every time the subscription starts listening: first, and again after each reconnect. It always runs before that connection delivers the subscription any notification. Re-read the state you track there instead of relying on every notification arriving.
+- The first subscription opens one dedicated, unpooled connection (one more beyond `database.maximum-pool-size` and the health check). Its reads time out after 15 seconds. It sends a keep-alive check every 30 seconds and, after a failure, reconnects with backoff from 1 to 30 seconds, logging one warning per outage.
+- Closing the last subscription stops listening on its channel but keeps the connection and thread until shutdown; subscriptions are meant to last for a plugin's enable.
+- `listen` may be called before readiness, but `onConnected` can then run before queries work. It throws `IllegalStateException` after initialization failure or shutdown; shutdown ends every subscription.
+
 ## PostgreSQL configuration
 
 The default `plugins/SneakyDB/config.yml` contains:

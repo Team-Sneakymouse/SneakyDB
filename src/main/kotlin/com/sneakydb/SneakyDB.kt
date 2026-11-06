@@ -2,6 +2,7 @@ package com.sneakydb
 
 import com.sneakydb.adapter.DatabaseSettings
 import com.sneakydb.adapter.PostgreSqlAdapter
+import com.sneakydb.adapter.openPostgreSqlNotificationConnection
 import org.bukkit.plugin.java.JavaPlugin
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -45,7 +46,8 @@ open class SneakyDB : JavaPlugin() {
             { task -> Thread(task, "SneakyDB-Worker").apply { isDaemon = true } },
             ThreadPoolExecutor.AbortPolicy(),
         )
-        val generation = DatabaseSession(executor) {
+        val notifications = NotificationWorker({ openPostgreSqlNotificationConnection(settings) }, logger::warning)
+        val generation = DatabaseSession(executor, notifications) {
             require(adapterId == "postgresql") { "Unsupported database adapter" }
             PostgreSqlAdapter().createDataSource(settings)
         }

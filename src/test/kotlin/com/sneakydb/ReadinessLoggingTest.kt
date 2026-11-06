@@ -25,6 +25,28 @@ class ReadinessLoggingTest {
         assertTrue(records.isEmpty())
     }
 
+    @Test fun `notification subscriptions leave readiness logging unchanged`() {
+        val notifications = NotificationWorker({ NotificationWorkerTest.FakeConnection() }, { logger.warning(it) }, startThread = { null })
+        val worker = DatabaseSessionTest.Worker()
+        val session = DatabaseSession(worker, notifications) { DatabaseSessionTest.Pool() }
+        session.whenReady().whenComplete { _, failure -> logReadinessFailure(logger, failure) }
+        val subscription = session.listen("pushes", java.util.function.Consumer {})
+        session.close()
+        subscription.close()
+        assertTrue(records.isEmpty(), "shutdown with a subscription logs nothing")
+
+        val failing = DatabaseSessionTest.Worker()
+        val failed = DatabaseSession(failing, NotificationWorker({ error("x") }, { logger.warning(it) }, startThread = { null })) {
+            error("password=secret")
+        }
+        failed.whenReady().whenComplete { _, failure -> logReadinessFailure(logger, failure) }
+        failing.runNext()
+        assertThrows(IllegalStateException::class.java) { failed.listen("pushes", java.util.function.Consumer {}) }
+        assertEquals(listOf("SneakyDB initialization failed during adapter creation; check adapter configuration and database access"),
+            records.map { it.message }, "one sanitized severe line, no notification warnings")
+        failed.close()
+    }
+
     @Test fun `unknown error text and driver causes are never logged`() {
         logReadinessFailure(logger, java.util.concurrent.CompletionException(
             IllegalStateException("password=secret", RuntimeException("private driver cause"))))
