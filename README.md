@@ -108,7 +108,7 @@ val subscription = database.listen("discord_push_tracking", { payload -> refresh
 - Channel names are lower-case identifiers (`[a-z_][a-z0-9_]{0,62}`); anything else throws `IllegalArgumentException`.
 - Callbacks run on the single `SneakyDB-Notifications` thread, one at a time. Keep them short, and schedule onto the server thread before touching Bukkit state. A callback that throws is logged by channel name and does not affect other subscriptions.
 - Notifications are not queued while the connection is down. `onConnected` runs every time the subscription starts listening: first, and again after each reconnect. Re-read the state you track there instead of relying on every notification arriving.
-- The first subscription opens one dedicated, unpooled connection (one more beyond `database.maximum-pool-size` and the health check). It sends a keep-alive check every 30 seconds and, after a failure, reconnects with backoff from 1 to 30 seconds, logging one warning per outage.
+- The first subscription opens one dedicated, unpooled connection (one more beyond `database.maximum-pool-size` and the health check). Its reads time out after 15 seconds. It sends a keep-alive check every 30 seconds and, after a failure, reconnects with backoff from 1 to 30 seconds, logging one warning per outage.
 - `listen` may be called before readiness. It throws `IllegalStateException` after initialization failure or shutdown; shutdown ends every subscription.
 
 ## PostgreSQL configuration

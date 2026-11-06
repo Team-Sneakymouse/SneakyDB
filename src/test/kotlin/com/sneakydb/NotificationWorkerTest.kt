@@ -13,7 +13,8 @@ class NotificationWorkerTest {
         var valid = true
         var closed = false
         var checks = 0
-        override fun listen(channel: String) { listened.add(channel) }
+        var onListen: (String) -> Unit = {}
+        override fun listen(channel: String) { listened.add(channel); onListen(channel) }
         override fun unlisten(channel: String) { unlistened.add(channel) }
         override fun poll(timeoutMs: Int): List<Pair<String, String>> {
             if (failPoll) throw java.sql.SQLException("secret driver detail")
@@ -64,6 +65,22 @@ class NotificationWorkerTest {
         assertEquals(listOf("42"), pushes)
         assertEquals(emptyList<String>(), other)
         assertEquals(1, connected)
+    }
+
+    @Test fun `a subscription added during LISTEN is announced only once its own channel listens`() {
+        subscribe("pushes")
+        worker.tick()
+        var lateConnected = 0
+        connections.single().onListen = { channel ->
+            if (channel == "other") subscribe("late", onConnected = { lateConnected++ })
+        }
+        subscribe("other")
+        worker.tick()
+        assertEquals(0, lateConnected, "not before LISTEN late")
+        assertFalse("late" in connections.single().listened)
+        worker.tick()
+        assertTrue("late" in connections.single().listened)
+        assertEquals(1, lateConnected)
     }
 
     @Test fun `a later subscription is listened and announced on the open connection`() {

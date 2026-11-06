@@ -33,6 +33,9 @@ class PostgreSqlNotificationTest {
         val payloads = LinkedBlockingQueue<String>()
         val connects = LinkedBlockingQueue<Unit>()
         val warnings = LinkedBlockingQueue<String>()
+        openPostgreSqlNotificationConnection(settings!!).use { connection ->
+            assertEquals(15_000, (connection as com.sneakydb.adapter.PostgreSqlNotificationConnection).networkTimeoutMs(), "reads are bounded")
+        }
         val worker = NotificationWorker({ openPostgreSqlNotificationConnection(settings!!) }, { warnings.add(it) }, pollMs = 100)
         try {
             worker.subscribe("sneakydb_test", Consumer { payloads.add(it) }, Runnable { connects.add(Unit) })

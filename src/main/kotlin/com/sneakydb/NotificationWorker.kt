@@ -105,11 +105,14 @@ internal class NotificationWorker(
     }
 
     private fun sync(current: NotificationConnection) {
-        val wanted = subscriptions.mapTo(HashSet()) { it.channel }
+        // One snapshot for both steps: a subscription added meanwhile waits for the next tick, so onConnected never
+        // runs before its channel listens (its re-read could otherwise miss a change made in between).
+        val snapshot = subscriptions.toList()
+        val wanted = snapshot.mapTo(HashSet()) { it.channel }
         (wanted - listened).forEach { current.listen(it); listened.add(it) }
         (listened - wanted).forEach { current.unlisten(it); listened.remove(it) }
-        for (subscription in subscriptions) {
-            if (subscription.announced == generation || subscription.closed) continue
+        for (subscription in snapshot) {
+            if (subscription.announced == generation || subscription.closed || subscription.channel !in listened) continue
             subscription.announced = generation
             guard(subscription.channel) { subscription.onConnected.run() }
         }
