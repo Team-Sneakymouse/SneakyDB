@@ -1,0 +1,11 @@
+# SneakyDB on Velocity. Same keys as the Paper config.yml `database:` section; copy the values over.
+# Read at proxy start; restart the proxy to apply edits. There is no maintenance section on a proxy.
+database:
+  adapter: postgresql
+  host: localhost
+  port: 5432
+  name: minecraft
+  username: minecraft
+  password: change-me
+  maximum-pool-size: 10
+  connection-timeout-ms: 5000
