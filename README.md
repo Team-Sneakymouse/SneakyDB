@@ -1,6 +1,6 @@
 # SneakyDB
 
-SneakyDB is a Paper plugin that provides an asynchronous, database-neutral API for other plugins. The first adapter is PostgreSQL. Consumers use the same Java API regardless of adapter, while SQL syntax remains the responsibility of the query author and target database.
+SneakyDB is a Paper plugin, and from the same JAR a Velocity plugin (see [Velocity](#velocity)), that provides an asynchronous, database-neutral API for other plugins. The first adapter is PostgreSQL. Consumers use the same Java API regardless of adapter, while SQL syntax remains the responsibility of the query author and target database.
 
 ## Consumer API
 
@@ -151,10 +151,62 @@ Health checks use a dedicated single-thread scheduler and a separate one-connect
 
 **CMI limitation:** CMI is an optional, ordered server dependency, accessed by command without a joined classpath. If CMI is missing/disabled, or dispatch fails, SneakyDB emits a credential-safe severe diagnostic and does not claim the server is protected. There is **no independent login/kick guard**, no automatic command retry, and no proof of admission policy from Bukkit's command-dispatch boolean. Installing/enabling CMI later requires a new SneakyDB enable generation or manual maintenance activation. Ensure CMI maintenance is available and correctly configured before relying on this fallback; close access manually if it is unavailable. This integration is unit/MockBukkit verified, not a live CMI-server test.
 
+## Velocity
+
+The same `SneakyDB-<version>.jar` is also a Velocity plugin (`velocity-plugin.json`, id `sneakydb`). Put it in the proxy's `plugins/` folder. Paper ignores `velocity-plugin.json` and Velocity ignores `paper-plugin.yml`; the Velocity entry point (`com.sneakydb.velocity.SneakyDBVelocity`) loads no Bukkit classes.
+
+### Proxy configuration
+
+The first proxy start writes `plugins/sneakydb/config.yml`:
+
+```yaml
+database:
+  adapter: postgresql
+  host: localhost
+  port: 5432
+  name: minecraft
+  username: minecraft
+  password: change-me
+  maximum-pool-size: 10
+  connection-timeout-ms: 5000
+```
+
+The keys, defaults and bounds are the same as the Paper `database:` section, so copy the values from a server's `plugins/SneakyDB/config.yml`. The file is read once at proxy start; restart the proxy to apply edits. A `maintenance:` section is ignored on the proxy. If the file cannot be read (for example invalid YAML), SneakyDB logs a warning naming the file and the error class (never the file content) and does not connect: readiness fails as for a bad adapter.
+
+### Velocity consumers
+
+Use the same API as on Paper: `SneakyDBProvider.getApi()`, then `whenReady()`, `query`, `execute` and `listen`, with the same [readiness and lifecycle contract](#readiness-and-lifecycle-contract). Declare the dependency in your `velocity-plugin.json` so SneakyDB loads first and its classes are visible to your plugin:
+
+```json
+"dependencies": [{ "id": "sneakydb", "optional": false }]
+```
+
+Compile against `sneakydb-api` (`compileOnly`, as on Paper) and do not shade it.
+
+Call `getApi()` from your `ProxyInitializeEvent` handler at normal order (the default) or later, or any time after that. SneakyDB subscribes to `ProxyInitializeEvent` with `priority = Short.MAX_VALUE`, ahead of every `PostOrder`, and registers the provider there with readiness pending. Before that event, including in your plugin's constructor, `getApi()` throws `IllegalStateException("SneakyDB is not loaded")`. A consumer handler at `Short.MAX_VALUE` itself is not guaranteed to run after SneakyDB.
+
+```java
+@Subscribe
+public void onProxyInitialize(ProxyInitializeEvent event) {
+    SneakyDBApi database = SneakyDBProvider.getApi();
+    database.whenReady()
+        .thenCompose(ignored -> database.execute("CREATE TABLE IF NOT EXISTS ...", java.util.List.of()))
+        .whenComplete((count, failure) -> { /* runs on a SneakyDB thread */ });
+}
+```
+
+SneakyDB shuts down on `ProxyShutdownEvent` with `priority = Short.MIN_VALUE`, after consumers' own shutdown handlers, with the same guarantees as Paper's disable: the provider is unregistered, pending readiness and operations fail, and nothing waits on the shutting-down thread. LISTEN/NOTIFY works as on Paper, on the same `SneakyDB-Notifications` thread.
+
+### Differences from Paper
+
+- **No maintenance fallback and no health checks.** A proxy has no CMI, so a database outage or failed startup does not close player access; the background health check exists only to trigger that fallback and is not started. The proxy therefore opens no extra health-check connection.
+- Initialization failure behaves otherwise as on Paper: readiness completes exceptionally, one credential-safe error line is logged (`SneakyDB initialization failed during …`), there is no retry, and the proxy keeps running. Fix the config or database and restart the proxy; Velocity cannot reload a single plugin.
+- There is no server thread: consumers schedule their own follow-up work (for example with Velocity's scheduler) instead of Bukkit's.
+
 ## Adapter design
 
 Adapters are selected and constructed inside SneakyDB. Each adapter supplies a pooled JDBC data source; consumers continue to call `query` and `execute` without depending on that adapter. Adding another database means adding its driver and adapter implementation, and registering its adapter identifier. SQL stays portable only to the extent that the caller writes portable SQL.
 
 ## Build and publish
 
-The plugin uses the EmptyPlugin Gradle wrapper and Team-Sneakymouse versioning. Builds require a git checkout with at least one commit. `./gradlew build` creates the plugin jar; Maven publications are `sneakydb` (server plugin) and `sneakydb-api` (consumer compile-time API). Publish to `https://maven.sneakyrp.com/releases` through the repository's configured GitHub Actions workflow.
+The plugin uses the EmptyPlugin Gradle wrapper and Team-Sneakymouse versioning. Builds require a git checkout with at least one commit. `./gradlew build` creates the plugin jar (Paper and Velocity, `sneakyrp.deployment.type` `paper-plugin,velocity-plugin`); Maven publications are `sneakydb` (server plugin) and `sneakydb-api` (consumer compile-time API). Publish to `https://maven.sneakyrp.com/releases` through the repository's configured GitHub Actions workflow.

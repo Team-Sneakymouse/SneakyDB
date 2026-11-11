@@ -39,6 +39,7 @@ repositories {
 
 val paperApi = "26.2.build.+"
 val mockBukkitVersion = "4.117.0"
+val velocityApi = "3.4.0-SNAPSHOT"
 
 /**
  * On Windows, a bare `bash` resolves to WSL's System32\bash.exe before PATH is searched.
@@ -192,11 +193,14 @@ fun resolveRunServerPluginJars(): List<File> {
 
 dependencies {
     compileOnly("io.papermc.paper:paper-api:$paperApi")
+    // Velocity entry point only (com.sneakydb.velocity); never bundled.
+    compileOnly("com.velocitypowered:velocity-api:$velocityApi")
     implementation("org.jetbrains.kotlin:kotlin-stdlib:2.3.21")
     implementation("com.zaxxer:HikariCP:6.3.0")
     implementation("org.postgresql:postgresql:42.7.7")
 
     testImplementation("io.papermc.paper:paper-api:$paperApi")
+    testImplementation("com.velocitypowered:velocity-api:$velocityApi")
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
     testImplementation("org.mockbukkit.mockbukkit:mockbukkit-v26.2:$mockBukkitVersion")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
@@ -219,7 +223,7 @@ tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach 
 tasks {
     processResources {
         inputs.property("version", project.version.toString())
-        filesMatching("paper-plugin.yml") {
+        filesMatching(listOf("paper-plugin.yml", "velocity-plugin.json")) {
             expand("version" to project.version.toString())
         }
     }
@@ -318,7 +322,7 @@ publishing {
             })
             pom {
                 name.set("SneakyDB API")
-                description.set("Java API for consumers of the SneakyDB Paper plugin.")
+                description.set("Java API for consumers of the SneakyDB Paper and Velocity plugin.")
                 url.set("https://github.com/Team-Sneakymouse/SneakyDB")
             }
         }
@@ -327,9 +331,9 @@ publishing {
             from(components["java"])
             pom {
                 name.set("SneakyDB")
-                description.set("Shared asynchronous database API for Team-Sneakymouse Paper plugins.")
+                description.set("Shared asynchronous database API for Team-Sneakymouse Paper and Velocity plugins.")
                 url.set("https://github.com/Team-Sneakymouse/SneakyDB")
-                properties.put("sneakyrp.deployment.type", "paper-plugin")
+                properties.put("sneakyrp.deployment.type", "paper-plugin,velocity-plugin")
                 licenses {
                     license {
                         name.set("GNU General Public License v3.0")

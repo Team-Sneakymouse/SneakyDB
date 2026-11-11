@@ -309,4 +309,21 @@ class DatabaseSessionTest {
         val session = DatabaseSession(Worker()) { Pool() }
         assertThrows(UnsupportedOperationException::class.java) { session.listen("pushes", java.util.function.Consumer {}) }
     }
+
+    @Test fun `workers resolve the bundled driver through SneakyDB's own loader`() {
+        val thread = workerThreads.newThread {}
+        assertSame(DatabaseSession::class.java.classLoader, thread.contextClassLoader)
+        assertTrue(thread.isDaemon)
+        assertEquals("SneakyDB-Worker", thread.name)
+    }
+
+    @Test fun `unreadable or unsupported config fails readiness during adapter creation`() {
+        val settings = com.sneakydb.adapter.DatabaseSettings("localhost", 5432, "minecraft", "minecraft", "password=secret", 1, 250)
+        for (config in listOf(null, DatabaseConfig("mysql", settings))) {
+            val session = startDatabaseSession(config) {}
+            val failure = assertThrows(java.util.concurrent.ExecutionException::class.java) { session.whenReady().get(5, TimeUnit.SECONDS) }
+            assertEquals("SneakyDB initialization failed during adapter creation; check adapter configuration and database access", failure.cause?.message)
+            session.close()
+        }
+    }
 }

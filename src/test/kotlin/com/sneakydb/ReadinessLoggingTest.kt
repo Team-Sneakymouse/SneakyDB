@@ -74,4 +74,20 @@ class ReadinessLoggingTest {
             session.close()
         }
     }
+
+    @Test fun `plain severe sink used on Velocity gets the same single line and nothing on shutdown`() {
+        val lines = mutableListOf<String>()
+        val worker = DatabaseSessionTest.Worker()
+        val failed = DatabaseSession(worker) { error("password=secret") }
+        failed.whenReady().whenComplete { _, failure -> logReadinessFailure(lines::add, failure) }
+        worker.runNext()
+        failed.close()
+        assertEquals(listOf("SneakyDB initialization failed during adapter creation; check adapter configuration and database access"), lines)
+
+        lines.clear()
+        val pending = DatabaseSession(DatabaseSessionTest.Worker()) { DatabaseSessionTest.Pool() }
+        pending.whenReady().whenComplete { _, failure -> logReadinessFailure(lines::add, failure) }
+        pending.close()
+        assertTrue(lines.isEmpty())
+    }
 }
