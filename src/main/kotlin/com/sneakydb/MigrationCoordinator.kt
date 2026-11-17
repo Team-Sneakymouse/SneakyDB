@@ -68,7 +68,7 @@ internal enum class StartupOutcome {
     /** No plugin failed, or there was nothing to run. */
     CLEAN,
 
-    /** Some plugins failed before any of their scripts ran, so the database is unchanged by them; the others migrated. */
+    /** Some plugins failed outside a running script (scripts they applied earlier in the run stay applied); the others migrated. */
     PLUGINS_FAILED,
 
     /** A script failed while running: no further script ran, and every plugin not completed by then failed. */
@@ -98,6 +98,9 @@ internal fun awaitStartup(startup: CompletableFuture<StartupOutcome>): StartupOu
     }
 }
 
+private const val HALTED =
+    "Migrations stopped: a script failed while running during startup and the server is stopping; see the server log"
+
 internal fun migrationThread(): ExecutorService = ThreadPoolExecutor(1, 1, 30, TimeUnit.SECONDS, LinkedBlockingQueue()) { task ->
     Thread(task, "SneakyDB-Migrations").apply {
         isDaemon = true
@@ -110,8 +113,8 @@ internal fun migrationThread(): ExecutorService = ThreadPoolExecutor(1, 1, 30, T
  * everything registered so far: the startup run (Paper: `ServerLoadEvent` at startup; Velocity: the end of proxy
  * initialisation), whose outcome [startup] reports and which the platform waits for. Later registrations wait in a
  * queue; when the executor gets to them, every registration queued by then forms one late batch. Batches run one after
- * another on [executor]. A script that fails while running stops its batch. [startup] never completes normally after
- * [close].
+ * another on [executor]. A script that fails while running stops its batch; in the startup run it also ends all
+ * further migration work in this generation. [startup] never completes normally after [close].
  */
 internal class MigrationCoordinator(
     private val settings: MigrationSettings,
@@ -126,6 +129,8 @@ internal class MigrationCoordinator(
     private val lock = Any()
     private var registering = true
     private var stopped = false
+    /** Set when the startup run stopped on a script that failed while running: the server is stopping, nothing runs any more. */
+    private var halted = false
     private val startupBatch = mutableListOf<Registration>()
     /** Late registrations not yet taken into a batch, and whether a task to take them is already submitted. */
     private val lateQueue = mutableListOf<Registration>()
@@ -149,6 +154,10 @@ internal class MigrationCoordinator(
         val submitLateTask = synchronized(lock) {
             if (stopped) {
                 result.completeExceptionally(IllegalStateException("SneakyDB has shut down"))
+                return result
+            }
+            if (halted) {
+                result.completeExceptionally(MigrationException(HALTED))
                 return result
             }
             if (pending.containsKey(plugin)) {
@@ -210,6 +219,16 @@ internal class MigrationCoordinator(
 
     private val isStopped get() = synchronized(lock) { stopped }
 
+    /** The startup run stopped the server: fails everything still registered and lets nothing register or run after it. */
+    private fun halt() {
+        val outstanding = synchronized(lock) {
+            halted = true
+            pending.values.toList().also { lateQueue.clear() }
+        }
+        val error = MigrationException(HALTED)
+        outstanding.forEach { it.result.completeExceptionally(error) }
+    }
+
     /** Runs the batch that [take] returns on the executor; late batches take what is queued when they start. */
     private fun submit(startupRun: Boolean, take: () -> List<Registration>) {
         try {
@@ -227,7 +246,11 @@ internal class MigrationCoordinator(
                     // Never leave a future pending, even if the run itself broke.
                     val error = MigrationException("Migrations stopped before they finished; see the server log")
                     batch.forEach { if (!it.result.isDone) { outcome = StartupOutcome.STOPPED; it.result.completeExceptionally(error) } }
-                    if (startupRun) startup.complete(outcome)
+                    if (startupRun) {
+                        // Before the platform learns of the stop: what registered during the run must not run after it.
+                        if (outcome == StartupOutcome.STOPPED) halt()
+                        startup.complete(outcome)
+                    }
                 }
             }
         } catch (_: RejectedExecutionException) {

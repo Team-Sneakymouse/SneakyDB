@@ -179,6 +179,26 @@ class MigrationCoordinatorTest {
         assertEquals(StartupOutcome.STOPPED, coordinator.startup.join())
     }
 
+    @Test fun `after the startup run stopped, what registered during it and later fails and runs nothing`() {
+        ready.complete(null)
+        store.failing.add("alpha:V1__s1.sql")
+        val executor = Queued()
+        val coordinator = MigrationCoordinator(MigrationSettings(MigrationMode.APPLY, 10), store, { ready }, info::add, severe::add, executor)
+        val alpha = coordinator.register("alpha", "")
+        lateinit var during: CompletableFuture<Int>
+        store.duringRead = { during = coordinator.register("during", "") } // registers while the startup run is going
+        coordinator.registrationClosed()
+        executor.runAll() // the startup run, then the late task that was queued for "during"
+        assertTrue(failureOf(alpha).contains("SQL state 42P01"))
+        assertEquals(StartupOutcome.STOPPED, coordinator.startup.join())
+        assertTrue(failureOf(during).startsWith("Migrations stopped: a script failed while running during startup"), failureOf(during))
+        val after = coordinator.register("after", "")
+        executor.runAll()
+        assertTrue(failureOf(after).startsWith("Migrations stopped: a script failed while running during startup"), failureOf(after))
+        assertTrue(store.log.isEmpty(), "no script of a late plugin ran: ${store.log}")
+        assertTrue(store.rows.isEmpty(), store.rows.toString())
+    }
+
     @Test fun `a late batch stops at a script that fails while running, without touching the startup outcome`() {
         ready.complete(null)
         val executor = Queued()

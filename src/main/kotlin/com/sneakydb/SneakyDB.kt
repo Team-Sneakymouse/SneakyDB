@@ -58,12 +58,17 @@ open class SneakyDB : JavaPlugin() {
         coordinator.registrationClosed(startupRun = true)
         when (awaitStartup(coordinator.startup)) {
             StartupOutcome.PLUGINS_FAILED -> {
-                logger.severe("Migrations failed for some plugins before any of their scripts ran (see the lines above); those " +
+                logger.severe("Migrations failed for some plugins outside a running script (see the lines above); those " +
                     "plugins stay inactive. Startup continues with CMI maintenance on: once the cause is fixed and the server " +
                     "restarted, switch it off by hand (cmi maintenance false).")
                 fallback.activateNow()
             }
-            StartupOutcome.STOPPED -> server.shutdown()
+            StartupOutcome.STOPPED -> {
+                // A health check that failed during the wait may have queued the maintenance command; Paper still runs
+                // queued tasks once before it stops. A stop leaves no maintenance behind.
+                fallback.close()
+                server.shutdown()
+            }
             StartupOutcome.CLEAN, null -> {}
         }
     }
@@ -82,8 +87,8 @@ open class SneakyDB : JavaPlugin() {
 /**
  * Runs [hold] at `ServerLoadEvent` with load type `STARTUP`. Paper fires it on the server thread once every plugin has
  * enabled, right before it lets the server's network channels accept connections and before the first tick; a reload
- * fires it with `RELOAD`, which starts nothing. Monitor priority, so registrations from other handlers of the same event
- * are in the startup run.
+ * fires it with `RELOAD`, which starts nothing. Monitor priority, so registrations from handlers that ran before this
+ * one are in the startup run; a monitor handler of a plugin enabled after SneakyDB runs after the wait and registers late.
  */
 internal class StartupListener(private val hold: () -> Unit) : Listener {
     @EventHandler(priority = EventPriority.MONITOR)

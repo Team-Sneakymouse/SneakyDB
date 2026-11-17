@@ -122,6 +122,8 @@ class PostgreSqlMigrationTest {
         coordinator.registrationClosed()
         val message = failure(plots)
         assertTrue(message.startsWith("Migrations for plots failed at V002__broken.sql: SQL state 42P01: ERROR: relation \"missing_table\" does not exist"), message)
+        // The plugin's future fails before the run's summary is logged: wait for the run to end before reading it.
+        assertEquals(StartupOutcome.STOPPED, coordinator.startup.get(30, TimeUnit.SECONDS))
         assertEquals(message, severe.first())
         assertTrue(severe.last().startsWith("Migrations (startup, apply mode) stopped: plots:V002__broken.sql failed while running"), severe.last())
         assertEquals(2, severe.size, severe.toString())
@@ -425,9 +427,9 @@ class PostgreSqlMigrationTest {
 
     @Test fun `a script that commits, begins again and then fails is reported as possibly half applied`() {
         val coordinator = session()
+        coordinator.registrationClosed() // run it as a late batch: after a startup run that stops, nothing may run on this coordinator
         val plots = coordinator.unchecked("plots", "V001__init.sql",
             "create table plots_early (id int);\ncommit;\nbegin;\ninsert into missing_table values (1);")
-        coordinator.registrationClosed()
         val message = failure(plots)
         assertTrue(message.contains("may hold part of its changes"), message)
         assertTrue(message.contains("SQL state 42P01"), message)
@@ -527,9 +529,11 @@ class PostgreSqlMigrationTest {
 
     @Test fun `a plugin whose startup migration failed still counts as installed for later registrations`() {
         val coordinator = session()
-        val broken = coordinator.add("broken", "V001__broken.sql" to "insert into missing_table values (1);")
+        // Caught before its script ran, so the server keeps running; a script that fails while running would stop it.
+        val broken = coordinator.add("broken", "V001__broken.sql" to "-- requires: missing >= 1\ncreate table broken_table (id int);")
         coordinator.registrationClosed()
         failure(broken)
+        assertEquals(StartupOutcome.PLUGINS_FAILED, coordinator.startup.get(30, TimeUnit.SECONDS))
         val optional = coordinator.add("optional", "V001__optional.sql" to "-- requires-if-present: broken >= 1\ncreate table optional_table (id int);")
         val message = failure(optional)
         assertTrue(message.contains("broken's migrations failed earlier on this server"), message)

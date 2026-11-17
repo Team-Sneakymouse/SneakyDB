@@ -34,6 +34,8 @@ class PostgreSqlAdapter : DatabaseAdapter {
         val timeoutSeconds = ((settings.connectionTimeoutMs + 999) / 1000).coerceAtLeast(1).toString()
         addDataSourceProperty("connectTimeout", timeoutSeconds)
         addDataSourceProperty("loginTimeout", timeoutSeconds)
+        // A database host that vanishes without closing the connection is noticed by the OS instead of never.
+        addDataSourceProperty("tcpKeepAlive", "true")
     }
 }
 
