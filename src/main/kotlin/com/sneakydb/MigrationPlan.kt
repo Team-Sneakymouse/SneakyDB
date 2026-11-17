@@ -52,14 +52,16 @@ internal class MigrationPlan(
  * Plans one run. [registered] maps each plugin of this batch to its scripts, or to the failure that discovering them
  * gave. [applied] holds the version table's rows for every plugin, registered or not. [earlier] holds the plugins that
  * registered earlier in this enable generation and are not in this batch, each with the reason its migrations failed
- * or null; they count as present for `requires-if-present`. Ties in the order go by plugin id, then version, so every
- * server computes the same order.
+ * or null; they count as present for `requires-if-present`. [waiting] names those of them whose registration has not
+ * finished (they registered after this batch was put together): their database version is not final yet. Ties in the
+ * order go by plugin id, then version, so every server computes the same order.
  */
 internal fun planMigrations(
     registered: Map<String, Result<List<MigrationScript>>>,
     applied: Map<String, List<AppliedVersion>>,
     mode: MigrationMode,
     earlier: Map<String, String?> = emptyMap(),
+    waiting: Set<String> = emptySet(),
 ): MigrationPlan {
     val failures = sortedMapOf<String, PluginFailure>()
     val fills = sortedSetOf<String>()
@@ -78,7 +80,8 @@ internal fun planMigrations(
     val steps = sortedMapOf<StepKey, PlannedStep>()
     val dependencies = HashMap<StepKey, MutableList<StepKey>>()
     val unresolved = HashMap<StepKey, String>()
-    // Every requirement between plugins, resolvable or not: they decide the groups.
+    // Every unmet requirement between plugins, resolvable or not: they decide the groups. One the database already
+    // satisfies imposes no order and links nothing.
     val links = mutableListOf<Pair<StepKey, String>>()
     for ((plugin, own) in scripts) {
         val current = databaseVersion(plugin)
@@ -94,13 +97,16 @@ internal fun planMigrations(
                 val present = other in registered || other in earlier || applied[other].orEmpty().isNotEmpty()
                 if (requirement.ifPresent && !present) { absent.add(requirement); continue }
                 effective.add(requirement)
-                links.add(key to other)
                 if (otherVersion >= requirement.version) continue
+                links.add(key to other)
                 val otherScripts = scripts[other]
                 when {
                     otherScripts != null && otherScripts.size >= requirement.version -> needs.add(StepKey(other, requirement.version))
                     unresolved.containsKey(key) -> {}
                     other in failures -> unresolved[key] = "${script.fileName} needs $requirement, but $other's migrations failed"
+                    other in waiting -> unresolved[key] = "${script.fileName} needs $requirement, but the database has $other at " +
+                        "version $otherVersion and $other registered after this plugin's migrations were planned, so its scripts " +
+                        "haven't run yet; restart the server so both are planned together"
                     otherScripts != null -> unresolved[key] = "${script.fileName} needs $requirement, but the database has $other at " +
                         "version $otherVersion and its build on this server only has scripts up to ${otherScripts.size}; " +
                         "install the $other build that adds that script together with this one"
@@ -116,8 +122,8 @@ internal fun planMigrations(
         }
     }
 
-    // Requirements connect scripts into groups, whether or not the required version is pending here; a group with an
-    // unresolvable requirement or a cycle fails as a whole.
+    // Unmet requirements connect scripts into groups, whether or not the required version is pending here; a group with
+    // an unresolvable requirement or a cycle fails as a whole.
     val groups = UnionFind(steps.keys)
     dependencies.forEach { (step, needs) -> needs.forEach { groups.union(step, it) } }
     val firstPending = steps.keys.groupBy { it.plugin }.mapValues { it.value.min() }

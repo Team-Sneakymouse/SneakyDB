@@ -125,6 +125,36 @@ class MigrationPlanTest {
         assertEquals(mapOf("gamma" to 1), plan.targetVersions)
     }
 
+    @Test fun `a requirement the database already satisfies joins no group`() {
+        // core and p each have V2 pending; p's requirement on core is met by the database, as is w's. Only w's
+        // requirement on a missing plugin is unmet, so only w fails.
+        val plan = plan(
+            plugin("core", "", ""), plugin("p", "", "-- requires: core >= 1"), plugin("w", "-- requires: core >= 1\n-- requires: missing >= 1"),
+            applied = mapOf("core" to applied(1), "p" to applied(1)),
+        )
+        assertEquals(setOf("w"), plan.failures.keys)
+        assertTrue(plan.failures.getValue("w").reason.contains("needs requires: missing >= 1"), plan.failures.getValue("w").reason)
+        assertEquals(listOf("core:V2__s2.sql", "p:V2__s2.sql"), plan.order)
+        // A satisfied requirement imposes no order either: p's step doesn't wait for core's pending one.
+        assertEquals(emptyList<StepKey>(), plan.dependents[StepKey("core", 2)].orEmpty())
+    }
+
+    @Test fun `a plugin registered after this batch was planned is not taken as final`() {
+        val registered = mapOf(plugin("lp", "-- requires-if-present: lq >= 1"))
+        val plan = planMigrations(registered, emptyMap(), MigrationMode.APPLY, earlier = mapOf("lq" to null), waiting = setOf("lq"))
+        val reason = plan.failures.getValue("lp").reason
+        assertTrue(reason.contains("lq registered after this plugin's migrations were planned"), reason)
+        assertTrue(reason.contains("restart the server"), reason)
+        assertFalse(reason.contains("goes no higher"), reason)
+        val hard = planMigrations(mapOf(plugin("lp", "-- requires: lq >= 1")), emptyMap(), MigrationMode.APPLY,
+            earlier = mapOf("lq" to null), waiting = setOf("lq"))
+        assertTrue(hard.failures.getValue("lp").reason.contains("lq registered after this plugin's migrations were planned"))
+        // Already satisfied by the database: nothing to wait for.
+        val satisfied = planMigrations(registered, mapOf("lq" to listOf(AppliedVersion(1, null))), MigrationMode.APPLY,
+            earlier = mapOf("lq" to null), waiting = setOf("lq"))
+        assertTrue(satisfied.failures.isEmpty())
+    }
+
     @Test fun `requiring a plugin whose checks failed is unresolvable`() {
         val broken = "broken" to Result.failure<List<MigrationScript>>(MigrationException("broken: bad name"))
         val plan = plan(broken, plugin("alpha", "-- requires: broken >= 1"))

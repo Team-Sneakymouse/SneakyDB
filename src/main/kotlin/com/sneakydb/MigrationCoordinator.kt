@@ -81,9 +81,10 @@ internal fun migrationThread(): ExecutorService = ThreadPoolExecutor(1, 1, 30, T
 
 /**
  * One enable generation's migrations. [register] only records a plugin; [registrationClosed] (first tick on Paper,
- * after proxy initialisation on Velocity) starts the startup run, and later registrations run as their own batches.
- * Batches run one after another on [executor]. [startup] completes with true once the startup run finished without a
- * failed plugin, false otherwise; it never completes normally after [close].
+ * after proxy initialisation on Velocity) starts the startup run. Later registrations wait in a queue; when the
+ * executor gets to them, every registration queued by then forms one batch. Batches run one after another on
+ * [executor]. [startup] completes with true once the startup run finished without a failed plugin, false otherwise; it
+ * never completes normally after [close].
  */
 internal class MigrationCoordinator(
     private val settings: MigrationSettings,
@@ -99,6 +100,10 @@ internal class MigrationCoordinator(
     private var registering = true
     private var stopped = false
     private val startupBatch = mutableListOf<Registration>()
+    /** Late registrations not yet taken into a batch, and whether a task to take them is already submitted. */
+    private val lateQueue = mutableListOf<Registration>()
+    private var lateTaskSubmitted = false
+    /** Registrations whose future is not complete yet, by plugin. */
     private val pending = HashMap<String, Registration>()
     /** Every plugin that registered in this enable generation, with the reason its latest registration failed, if it did. */
     private val generation = HashMap<String, String?>()
@@ -114,7 +119,7 @@ internal class MigrationCoordinator(
             return result
         }
         val registration = Registration(plugin, scripts, result)
-        val late = synchronized(lock) {
+        val submitLateTask = synchronized(lock) {
             if (stopped) {
                 result.completeExceptionally(IllegalStateException("SneakyDB has shut down"))
                 return result
@@ -126,16 +131,27 @@ internal class MigrationCoordinator(
             }
             pending[plugin] = registration
             generation.putIfAbsent(plugin, null)
-            if (registering) startupBatch.add(registration)
-            !registering
-        }
-        result.whenComplete { _, failure ->
-            synchronized(lock) {
-                pending.remove(plugin, registration)
-                generation[plugin] = failure?.let { describeFailure(it) }
+            // Attached before the lock is released: a task already submitted may take the registration right after.
+            result.whenComplete { _, failure ->
+                synchronized(lock) {
+                    pending.remove(plugin, registration)
+                    generation[plugin] = failure?.let { describeFailure(it) }
+                }
+            }
+            if (registering) {
+                startupBatch.add(registration)
+                false
+            } else {
+                lateQueue.add(registration)
+                !lateTaskSubmitted.also { lateTaskSubmitted = true }
             }
         }
-        if (late) submit(listOf(registration), "late registration of $plugin", startupRun = false)
+        if (submitLateTask) submit(startupRun = false) {
+            synchronized(lock) {
+                lateTaskSubmitted = false
+                lateQueue.toList().also { lateQueue.clear() }
+            }
+        }
         return result
     }
 
@@ -147,13 +163,13 @@ internal class MigrationCoordinator(
             startupBatch.toList().also { startupBatch.clear() }
         }
         if (batch.isEmpty()) startup.complete(true)
-        else submit(batch, "startup", startupRun = true)
+        else submit(startupRun = true) { batch }
     }
 
     fun close() {
         val outstanding = synchronized(lock) {
             stopped = true
-            pending.values.toList().also { startupBatch.clear() }
+            pending.values.toList().also { startupBatch.clear(); lateQueue.clear() }
         }
         val error = IllegalStateException("SneakyDB has shut down")
         outstanding.forEach { it.result.completeExceptionally(error) }
@@ -163,9 +179,13 @@ internal class MigrationCoordinator(
 
     private val isStopped get() = synchronized(lock) { stopped }
 
-    private fun submit(batch: List<Registration>, label: String, startupRun: Boolean) {
+    /** Runs the batch that [take] returns on the executor; late batches take what is queued when they start. */
+    private fun submit(startupRun: Boolean, take: () -> List<Registration>) {
         try {
             executor.execute {
+                val batch = take()
+                if (batch.isEmpty()) return@execute
+                val label = if (startupRun) "startup" else "late registration of ${batch.joinToString { it.plugin }}"
                 var succeeded = false
                 try {
                     succeeded = runBatch(batch, label)
@@ -180,7 +200,7 @@ internal class MigrationCoordinator(
             }
         } catch (_: RejectedExecutionException) {
             val error = IllegalStateException("SneakyDB has shut down")
-            batch.forEach { it.result.completeExceptionally(error) }
+            take().forEach { it.result.completeExceptionally(error) }
             startup.completeExceptionally(error)
         }
     }
@@ -207,9 +227,12 @@ internal class MigrationCoordinator(
             batch.forEach { run.fail(it.plugin, null, describeFailure(error)) }
             return run.finish(label, started)
         }
-        // Plugins of earlier batches of this generation count as present, failed ones included.
-        val earlier = synchronized(lock) { generation.filterKeys { it !in discovered } }
-        val plan = planMigrations(discovered, applied, settings.mode, earlier)
+        // Plugins of other batches of this generation count as present, failed ones included. Those still pending
+        // registered after this batch was put together: their version is not final until their own batch has run.
+        val (earlier, waiting) = synchronized(lock) {
+            generation.filterKeys { it !in discovered } to pending.keys.filterTo(HashSet()) { it !in discovered }
+        }
+        val plan = planMigrations(discovered, applied, settings.mode, earlier, waiting)
         plan.failures.forEach { (plugin, failure) -> run.fail(plugin, failure.script, failure.reason) }
 
         for (plugin in plan.checksumFills) {

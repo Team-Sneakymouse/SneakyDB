@@ -35,9 +35,13 @@ class MigrationCoordinatorTest {
 
         private fun snapshot() = rows.mapValues { (_, versions) -> versions.map { AppliedVersion(it.key, it.value) } }
 
+        /** Runs once, inside the next read: what happens while a batch is being planned. */
+        var duringRead: (() -> Unit)? = null
+
         override fun readApplied(mode: MigrationMode): Map<String, List<AppliedVersion>> {
             modes.add(mode)
             readFailure?.let { throw it }
+            duringRead?.also { duringRead = null }?.invoke()
             return snapshot()
         }
 
@@ -205,6 +209,48 @@ class MigrationCoordinatorTest {
         val failing = coordinator.register("failing", "")
         assertTrue(failureOf(failing).startsWith("Migrations for failing failed at V1__s1.sql"))
         assertTrue(coordinator.startup.join())
+    }
+
+    /** Queues batches until [runAll], like the migration thread while it is busy with an earlier batch. */
+    class Queued : AbstractExecutorService() {
+        private val tasks = ArrayDeque<Runnable>()
+        override fun execute(task: Runnable) { tasks.add(task) }
+        fun runAll() { while (tasks.isNotEmpty()) tasks.removeFirst().run() }
+        override fun shutdown() {}
+        override fun shutdownNow(): MutableList<Runnable> = mutableListOf()
+        override fun isShutdown() = false
+        override fun isTerminated() = false
+        override fun awaitTermination(timeout: Long, unit: TimeUnit) = true
+    }
+
+    @Test fun `late registrations queued at the same time are planned together as one batch`() {
+        ready.complete(null)
+        val executor = Queued()
+        val coordinator = MigrationCoordinator(MigrationSettings(MigrationMode.APPLY, 10, "starting"), store, { ready }, info::add, severe::add, executor)
+        coordinator.registrationClosed()
+        val lp = coordinator.register("lp", "-- requires-if-present: lq >= 1")
+        val lq = coordinator.register("lq", "")
+        executor.runAll()
+        assertEquals(1, lp.join())
+        assertEquals(1, lq.join())
+        assertEquals(listOf("lq:V1__s1.sql", "ready lq", "lp:V1__s1.sql", "ready lp"), store.log)
+        assertTrue(info.last().startsWith("Migrations (late registration of lp, lq, apply mode): 2 scripts applied"), info.last())
+        assertTrue(severe.isEmpty(), severe.toString())
+    }
+
+    @Test fun `a plugin that registers while a late batch is planned is not taken as having its final version`() {
+        ready.complete(null)
+        val executor = Queued()
+        val coordinator = MigrationCoordinator(MigrationSettings(MigrationMode.APPLY, 10, "starting"), store, { ready }, info::add, severe::add, executor)
+        coordinator.registrationClosed()
+        var lq: CompletableFuture<Int>? = null
+        store.duringRead = { lq = coordinator.register("lq", "") }
+        val lp = coordinator.register("lp", "-- requires-if-present: lq >= 1")
+        executor.runAll()
+        val message = failureOf(lp)
+        assertTrue(message.contains("lq registered after this plugin's migrations were planned"), message)
+        assertFalse(message.contains("goes no higher"), message)
+        assertEquals(1, lq!!.join(), "lq's own batch runs right after")
     }
 
     @Test fun `a re-enabled plugin may register again once its previous registration finished`() {
