@@ -10,7 +10,9 @@ import kotlin.jvm.JvmSuppressWildcards
  * Completion callbacks may run inline; do not block them or access Bukkit state without rescheduling.
  *
  * Keep signatures to JDK types only (no Kotlin, Paper, JDBC or Hikari types) and add overloads rather than changing them;
- * consumers (SneakyJobBoard, SneakyPrototypeKit, LoMPhoneBridge) pin a version with compileOnly, so grep them first.
+ * consumers pin a version with compileOnly, and many implement this interface as a test double, so grep them first:
+ * lom-phone-app, resource-pipeline, SneakyCharacterManager-Paper, SneakyJobBoard, SneakyLeveling, SneakyMail, SneakyMisc,
+ * SneakyMobile, SneakyPipeMonitor, SneakyPlots, SneakyPrototypeKit, SneakyRoamin. New methods need a default body.
  */
 interface SneakyDBApi {
     /** Executes a query and returns each row as a column-label/value map. */
@@ -20,6 +22,20 @@ interface SneakyDBApi {
     /** Executes an insert, update, or delete and returns the affected row count. */
     @JvmSuppressWildcards
     fun execute(sql: String, parameters: List<*>): CompletableFuture<Int>
+
+    /**
+     * Runs [work] in one database transaction on a worker that holds one pooled connection with autocommit off.
+     * When [work] returns, the transaction commits and the future completes with its value; when it throws, the
+     * transaction rolls back and the future completes exceptionally with that exception. A failed commit fails the
+     * future too, which never completes normally unless the commit succeeded.
+     *
+     * The handle's calls block. It is valid only inside [work], on the worker thread. Calling [query], [execute] or
+     * [transaction] from inside [work] fails with IllegalStateException; use the handle. Same admission rules as
+     * [query]: fails through the future before readiness, after failure or shutdown, and when the workers are full.
+     * Completing or cancelling the future before [work] returns rolls the transaction back (work is not interrupted).
+     */
+    fun <T> transaction(work: java.util.function.Function<SneakyDBTransaction, T>): CompletableFuture<T> =
+        throw UnsupportedOperationException("This SneakyDB API does not support transactions")
 
     /**
      * Completes after acquisition and successful finite-time connection validation, or exceptionally

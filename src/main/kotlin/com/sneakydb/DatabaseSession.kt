@@ -20,6 +20,8 @@ internal class DatabaseSession(
     private var failure: IllegalStateException? = null
     private var stopped = false
     private val operations = HashSet<CompletableFuture<*>>()
+    /** Set on a worker while it runs a transaction, to reject calls that would need a second connection. */
+    private val insideTransaction = ThreadLocal<Boolean>()
 
     init {
         executor.execute {
@@ -57,35 +59,39 @@ internal class DatabaseSession(
         return worker.subscribe(channel, onNotification, onConnected)
     }
 
-    override fun query(sql: String, parameters: List<*>): CompletableFuture<List<Map<String, Any?>>> = submit { pool ->
-        pool.connection.use { connection ->
-            connection.prepareStatement(sql).use { statement ->
-                parameters.forEachIndexed { index, value -> statement.setObject(index + 1, value) }
-                statement.executeQuery().use { result ->
-                    val metadata = result.metaData
-                    val rows = ArrayList<Map<String, Any?>>()
-                    while (result.next()) {
-                        val row = LinkedHashMap<String, Any?>()
-                        for (column in 1..metadata.columnCount) row[metadata.getColumnLabel(column)] = result.getObject(column)
-                        rows.add(java.util.Collections.unmodifiableMap(row))
-                    }
-                    java.util.Collections.unmodifiableList(rows)
-                }
-            }
-        }
+    override fun query(sql: String, parameters: List<*>): CompletableFuture<List<Map<String, Any?>>> = submit { pool, _ ->
+        pool.connection.use { readRows(it, sql, parameters) }
     }
 
-    override fun execute(sql: String, parameters: List<*>): CompletableFuture<Int> = submit { pool ->
-        pool.connection.use { connection ->
-            connection.prepareStatement(sql).use { statement ->
-                parameters.forEachIndexed { index, value -> statement.setObject(index + 1, value) }
-                statement.executeUpdate()
-            }
-        }
+    override fun execute(sql: String, parameters: List<*>): CompletableFuture<Int> = submit { pool, _ ->
+        pool.connection.use { executeUpdate(it, sql, parameters) }
     }
 
-    private fun <T> submit(operation: (HikariDataSource) -> T): CompletableFuture<T> {
+    override fun <T> transaction(work: java.util.function.Function<SneakyDBTransaction, T>): CompletableFuture<T> =
+        inTransaction { scope ->
+            val handle = TransactionHandle(scope)
+            try { work.apply(handle) } finally { handle.close() }
+        }
+
+    /**
+     * Runs [block] on a worker in one transaction on a dedicated pooled connection, with the admission, shutdown and
+     * cleanup rules of [transaction]. For SneakyDB's own code, which may use the raw connection; consumers use [transaction].
+     */
+    internal fun <T> inTransaction(block: (TransactionScope) -> T): CompletableFuture<T> = submit { pool, abandoned ->
+        insideTransaction.set(true)
+        try { runTransaction(pool, abandoned, block) } finally { insideTransaction.remove() }
+    }
+
+    /** [operation] gets the pool and a check that turns true once shutdown or completion of the future abandoned the work. */
+    private fun <T> submit(operation: (HikariDataSource, () -> Boolean) -> T): CompletableFuture<T> {
         val result = CompletableFuture<T>()
+        if (insideTransaction.get() == true) {
+            // The calling worker holds a transaction: another connection can't see or join it, and waiting on one can
+            // starve the four workers or deadlock on the transaction's own row locks.
+            result.completeExceptionally(IllegalStateException(
+                "SneakyDB query, execute and transaction can't be called inside a transaction's work; use its transaction handle"))
+            return result
+        }
         val selected = synchronized(lock) {
             if (stopped || failure != null) null else source?.also { operations.add(result) }
         }
@@ -94,13 +100,15 @@ internal class DatabaseSession(
             result.completeExceptionally(synchronized(lock) { failure } ?: IllegalStateException("SneakyDB is not ready or has shut down"))
             return result
         }
+        val abandoned = { synchronized(lock) { stopped } || result.isDone }
         try {
             executor.execute {
                 // Claim work atomically with shutdown; JDBC runs outside the lifecycle lock.
                 val admitted = synchronized(lock) { !stopped && !result.isDone }
                 if (!admitted) return@execute
-                try { result.complete(operation(selected)) }
-                catch (error: Exception) { result.completeExceptionally(error) }
+                try { result.complete(operation(selected, abandoned)) }
+                // Throwable, not Exception: an Error from a transaction's work must still settle its future.
+                catch (error: Throwable) { result.completeExceptionally(error) }
             }
         } catch (error: java.util.concurrent.RejectedExecutionException) {
             result.completeExceptionally(IllegalStateException("SneakyDB worker unavailable: shut down or queue capacity exhausted", error))

@@ -34,7 +34,7 @@ repositories {
     mavenCentral()
     maven("https://repo.papermc.io/repository/maven-public/")
     // Internal Team-Sneakymouse / Lords of Minecraft artifacts:
-    maven("https://maven.sneakyrp.com/releases")
+    maven("https://maven.sneakyrp.com/sneakymouse")
 }
 
 val paperApi = "26.2.build.+"
@@ -318,6 +318,7 @@ publishing {
                     // Kotlin may emit DefaultImpls for the interface default methods.
                     include("com/sneakydb/SneakyDBApi\$*.class")
                     include("com/sneakydb/SneakyDBProvider.class")
+                    include("com/sneakydb/SneakyDBTransaction.class")
                 }
             })
             pom {
@@ -357,7 +358,7 @@ publishing {
     repositories {
         maven {
             name = "sneakyrp"
-            url = uri("https://maven.sneakyrp.com/releases")
+            url = uri("https://maven.sneakyrp.com/sneakymouse")
             credentials(PasswordCredentials::class)
             authentication {
                 create<org.gradle.authentication.http.BasicAuthentication>("basic")

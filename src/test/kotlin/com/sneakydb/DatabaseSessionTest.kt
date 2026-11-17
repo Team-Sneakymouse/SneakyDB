@@ -33,15 +33,27 @@ class DatabaseSessionTest {
         var connectionClosed = false
         var preparedSql: String? = null
         val bindings = linkedMapOf<Int, Any?>()
+        /** Transaction-relevant connection calls in order, e.g. `autoCommit=false`, `sql:...`, `commit`, `close`. */
+        val events = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var commitFailure: java.sql.SQLException? = null
+        var rollbackFailure: java.sql.SQLException? = null
+        var statementFailure: java.sql.SQLException? = null
+        var evicted = false
+        override fun evictConnection(connection: Connection) { evicted = true; events.add("evict") }
         override fun getConnection(): Connection {
             acquired++
             failure?.let { throw it }
             return Proxy.newProxyInstance(javaClass.classLoader, arrayOf(Connection::class.java)) { _, method, args ->
                 when (method.name) {
                     "isValid" -> { timeout = args!![0] as Int; onValidate(); valid }
-                    "close" -> { connectionClosed = true; null }
+                    "close" -> { connectionClosed = true; events.add("close"); null }
+                    "setAutoCommit" -> { events.add("autoCommit=${args!![0]}"); null }
+                    "commit" -> { commitFailure?.let { throw it }; events.add("commit"); null }
+                    "rollback" -> { rollbackFailure?.let { throw it }; events.add("rollback"); null }
                     "prepareStatement" -> {
+                        statementFailure?.let { throw it }
                         preparedSql = args!![0] as String
+                        events.add("sql:$preparedSql")
                         Proxy.newProxyInstance(javaClass.classLoader, arrayOf(java.sql.PreparedStatement::class.java)) { _, call, values ->
                             when (call.name) {
                                 "setObject" -> { bindings[values!![0] as Int] = values[1]; null }
@@ -286,6 +298,87 @@ class DatabaseSessionTest {
         assertTrue(session.isAvailable())
         assertTrue(pool.timeout in 1..10)
         assertTrue(pool.connectionClosed)
+    }
+
+    @Test fun `transaction follows query admission rules and never waits for readiness`() {
+        val worker = Worker()
+        val pool = Pool()
+        val session = DatabaseSession(worker) { pool }
+        assertTrue(session.transaction { 1 }.isCompletedExceptionally, "pending")
+        assertEquals(1, worker.tasks.size, "only initialization is queued")
+        worker.runNext()
+        worker.shutdown()
+        val rejected = session.transaction { 1 }
+        val error = assertThrows(java.util.concurrent.CompletionException::class.java) { rejected.join() }
+        assertTrue(error.cause!!.message!!.contains("queue capacity exhausted"))
+        session.close()
+        assertTrue(session.transaction { 1 }.isCompletedExceptionally, "after shutdown")
+        assertEquals(1, pool.acquired)
+
+        val failing = Worker()
+        val failed = DatabaseSession(failing) { error("password=secret") }
+        failing.runNext()
+        val initialization = assertThrows(java.util.concurrent.CompletionException::class.java) { failed.transaction { 1 }.join() }
+        assertTrue(initialization.cause!!.message!!.contains("initialization failed"))
+        assertFalse(initialization.stackTraceToString().contains("secret"))
+        failed.close()
+    }
+
+    @Test fun `shutdown during a transaction fails its future, refuses further statements and rolls back`() {
+        val worker = Worker()
+        val pool = Pool()
+        val session = DatabaseSession(worker) { pool }
+        worker.runNext()
+        pool.events.clear()
+        val result = session.transaction { tx ->
+            tx.execute("UPDATE a SET x = 1", emptyList<Any>())
+            session.close()
+            tx.execute("UPDATE b SET x = 1", emptyList<Any>())
+        }
+        worker.runNext()
+        val error = assertThrows(java.util.concurrent.CompletionException::class.java) { result.join() }
+        assertEquals("SneakyDB has shut down", error.cause!!.message)
+        assertEquals(listOf("autoCommit=false", "sql:UPDATE a SET x = 1", "rollback", "autoCommit=true", "close"), pool.events)
+
+        // Work that returns after shutdown without another statement is rolled back too, never committed.
+        val quiet = Worker()
+        val quietPool = Pool()
+        val other = DatabaseSession(quiet) { quietPool }
+        quiet.runNext()
+        quietPool.events.clear()
+        other.transaction { tx -> tx.execute("UPDATE a SET x = 1", emptyList<Any>()); other.close(); 1 }
+        quiet.runNext()
+        assertFalse("commit" in quietPool.events)
+        assertTrue("rollback" in quietPool.events)
+    }
+
+    @Test fun `shutdown does not wait for a blocked transaction`() {
+        val pool = Pool()
+        val session = DatabaseSession(java.util.concurrent.Executors.newSingleThreadExecutor(workerThreads)) { pool }
+        session.whenReady().get(2, TimeUnit.SECONDS)
+        pool.events.clear()
+        val started = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        var thread: String? = null
+        val result = session.transaction { tx ->
+            thread = Thread.currentThread().name
+            tx.execute("UPDATE a SET x = 1", emptyList<Any>())
+            started.countDown()
+            // Shutdown interrupts the worker best-effort; keep blocking like a JDBC call that ignores interrupts.
+            while (release.count > 0) java.util.concurrent.locks.LockSupport.parkNanos(1_000_000)
+            1
+        }
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+        val begin = System.nanoTime()
+        session.close()
+        assertTrue(System.nanoTime() - begin < TimeUnit.SECONDS.toNanos(1), "close returned while work was blocked")
+        assertTrue(result.isCompletedExceptionally)
+        release.countDown()
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+        while ("close" !in pool.events && System.nanoTime() < deadline) Thread.sleep(10)
+        assertEquals("SneakyDB-Worker", thread)
+        assertFalse("commit" in pool.events)
+        assertTrue("rollback" in pool.events)
     }
 
     private fun notifications() = NotificationWorker({ NotificationWorkerTest.FakeConnection() }, {}, startThread = { null })
