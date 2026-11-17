@@ -421,6 +421,55 @@ class PostgreSqlMigrationTest {
         assertTrue(exists("plots_b"), "the part after the rollback ran in a transaction of its own: the database holds part of the script")
     }
 
+    @Test fun `a script that commits, begins again and then fails is reported as possibly half applied`() {
+        val coordinator = session()
+        val plots = coordinator.unchecked("plots", "V001__init.sql",
+            "create table plots_early (id int);\ncommit;\nbegin;\ninsert into missing_table values (1);")
+        coordinator.registrationClosed()
+        val message = failure(plots)
+        assertTrue(message.contains("may hold part of its changes"), message)
+        assertTrue(message.contains("SQL state 42P01"), message)
+        assertEquals(emptyList<String>(), versions())
+        assertTrue(exists("plots_early"), "the part before the commit stayed: the database holds part of the script")
+        // The pool still works for the next script.
+        val next = coordinator.add("other", "V001__other.sql" to "create table other_table (id int);")
+        assertEquals(1, next.await())
+    }
+
+    @Test fun `scripts don't run when standard_conforming_strings is off on their connection`() {
+        sql("alter database $database set standard_conforming_strings = off")
+        val coordinator = session()
+        val plots = coordinator.add("plots", "V001__init.sql" to "create table plots (id int);")
+        coordinator.registrationClosed()
+        val message = failure(plots)
+        assertTrue(message.contains("standard_conforming_strings is off"), message)
+        assertFalse(exists("plots"))
+        assertEquals(emptyList<String>(), versions())
+    }
+
+    @Test fun `a script that turns standard_conforming_strings off fails at its next statement`() {
+        val coordinator = session()
+        // With the setting off, PostgreSQL reads \' as an escaped quote: the string never ends.
+        val plots = coordinator.add("plots", "V001__init.sql" to
+            "create table plots (id int);\nset standard_conforming_strings = off;\nselect '\\'; select 1; --';\ncreate table plots_after (id int);")
+        coordinator.registrationClosed()
+        val message = failure(plots)
+        assertTrue(message.contains("SQL state 42601"), message)
+        assertFalse(message.contains("may hold part"), message)
+        assertFalse(exists("plots"))
+        assertFalse(exists("plots_after"))
+        assertEquals(emptyList<String>(), versions())
+    }
+
+    @Test fun `a column named end inside a BEGIN ATOMIC body runs`() {
+        val coordinator = session()
+        val plots = coordinator.add("plots", "V001__functions.sql" to
+            "create table plots_ends (\"end\" int);\nCREATE FUNCTION plots_end() RETURNS integer LANGUAGE SQL\nBEGIN ATOMIC\n    SELECT 1 AS end;\nEND;")
+        coordinator.registrationClosed()
+        assertEquals(1, plots.await())
+        assertEquals(listOf(1), rows("select plots_end()") { it.getInt(1) })
+    }
+
     @Test fun `BEGIN and END inside function bodies and DO blocks run`() {
         val coordinator = session()
         val plots = coordinator.add("plots", "V001__functions.sql" to """
