@@ -34,7 +34,7 @@ repositories {
     mavenCentral()
     maven("https://repo.papermc.io/repository/maven-public/")
     // Internal Team-Sneakymouse / Lords of Minecraft artifacts:
-    maven("https://maven.sneakyrp.com/releases")
+    maven("https://maven.sneakyrp.com/sneakymouse")
 }
 
 val paperApi = "26.2.build.+"
@@ -358,7 +358,7 @@ publishing {
     repositories {
         maven {
             name = "sneakyrp"
-            url = uri("https://maven.sneakyrp.com/releases")
+            url = uri("https://maven.sneakyrp.com/sneakymouse")
             credentials(PasswordCredentials::class)
             authentication {
                 create<org.gradle.authentication.http.BasicAuthentication>("basic")

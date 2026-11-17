@@ -91,7 +91,7 @@ dependencies:
 Compile against the API artifact, not the shaded server plugin:
 
 ```kotlin
-repositories { maven("https://maven.sneakyrp.com/releases") }
+repositories { maven("https://maven.sneakyrp.com/sneakymouse") }
 dependencies { compileOnly("io.github.team-sneakymouse:sneakydb-api:<version>") }
 ```
 
@@ -242,4 +242,4 @@ Adapters are selected and constructed inside SneakyDB. Each adapter supplies a p
 
 ## Build and publish
 
-The plugin uses the EmptyPlugin Gradle wrapper and Team-Sneakymouse versioning. Builds require a git checkout with at least one commit. `./gradlew build` creates the plugin jar (Paper and Velocity, `sneakyrp.deployment.type` `paper-plugin,velocity-plugin`); Maven publications are `sneakydb` (server plugin) and `sneakydb-api` (consumer compile-time API). Publish to `https://maven.sneakyrp.com/releases` through the repository's configured GitHub Actions workflow.
+The plugin uses the EmptyPlugin Gradle wrapper and Team-Sneakymouse versioning. Builds require a git checkout with at least one commit. `./gradlew build` creates the plugin jar (Paper and Velocity, `sneakyrp.deployment.type` `paper-plugin,velocity-plugin`); Maven publications are `sneakydb` (server plugin) and `sneakydb-api` (consumer compile-time API). Publish to `https://maven.sneakyrp.com/sneakymouse` through the repository's configured GitHub Actions workflow.
