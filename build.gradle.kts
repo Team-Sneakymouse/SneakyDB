@@ -318,6 +318,7 @@ publishing {
                     // Kotlin may emit DefaultImpls for the interface default methods.
                     include("com/sneakydb/SneakyDBApi\$*.class")
                     include("com/sneakydb/SneakyDBProvider.class")
+                    include("com/sneakydb/SneakyDBTransaction.class")
                 }
             })
             pom {

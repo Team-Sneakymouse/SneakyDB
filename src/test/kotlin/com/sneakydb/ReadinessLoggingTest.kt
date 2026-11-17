@@ -47,6 +47,17 @@ class ReadinessLoggingTest {
         failed.close()
     }
 
+    @Test fun `shutdown during a transaction leaves readiness logging unchanged`() {
+        val worker = DatabaseSessionTest.Worker()
+        val session = DatabaseSession(worker) { DatabaseSessionTest.Pool() }
+        session.whenReady().whenComplete { _, failure -> logReadinessFailure(logger, failure) }
+        worker.runNext()
+        val result = session.transaction { session.close(); 1 }
+        worker.runNext()
+        assertTrue(result.isCompletedExceptionally)
+        assertTrue(records.isEmpty(), "readiness succeeded; a transaction cut short by shutdown logs nothing")
+    }
+
     @Test fun `unknown error text and driver causes are never logged`() {
         logReadinessFailure(logger, java.util.concurrent.CompletionException(
             IllegalStateException("password=secret", RuntimeException("private driver cause"))))

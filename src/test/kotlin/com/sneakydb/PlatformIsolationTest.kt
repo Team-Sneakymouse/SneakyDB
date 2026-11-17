@@ -16,6 +16,7 @@ class PlatformIsolationTest {
         "velocity.SneakyDBVelocity", "velocity.ProxyRuntime", "velocity.ProxyConfig", "DatabaseConfig",
         "DatabaseStartupKt", "DatabaseSession", "NotificationWorker", "SneakyDBProvider", "SneakyDBRegistry",
         "adapter.PostgreSqlAdapter", "adapter.DatabaseAdapterKt",
+        "SneakyDBTransaction", "TransactionsKt", "TransactionScope", "TransactionHandle",
     )
 
     @Test fun `each entry point links without the other platform's API`() {
