@@ -1,5 +1,10 @@
 package com.sneakydb
 
+import net.kyori.adventure.text.Component
+import org.bukkit.event.EventHandler
+import org.bukkit.event.EventPriority
+import org.bukkit.event.Listener
+import org.bukkit.event.player.AsyncPlayerPreLoginEvent
 import org.bukkit.plugin.java.JavaPlugin
 
 /** Paper entry point (paper-plugin.yml). The Velocity entry point is com.sneakydb.velocity.SneakyDBVelocity. */
@@ -12,8 +17,12 @@ open class SneakyDB : JavaPlugin() {
         saveDefaultConfig()
         // An explicit null default keeps Bukkit's getX(path, default) semantics: the jar's defaults don't apply.
         val database = DatabaseConfig.read { config.get("database.$it", null) }
+        val migrations = MigrationSettings.read({ config.get("migrations.$it", null) }, logger::warning)
+        // Closed from here until the startup migration run has finished; Bukkit drops the listener on disable.
+        val gate = LoginGate(migrations.loginMessage)
+        server.pluginManager.registerEvents(LoginGateListener(gate), this)
         val settings = database.settings
-        val generation = startDatabaseSession(database, logger::warning)
+        val generation = startDatabaseSession(database, migrations, logger::info, logger::severe, logger::warning)
         session = generation
         SneakyDBRegistry.api = generation
         val cmi = CmiMaintenance(
@@ -36,6 +45,11 @@ open class SneakyDB : JavaPlugin() {
             if (failure != null) logReadinessFailure(logger, failure)
             else if (generation.isAvailable()) logger.info("PostgreSQL adapter connected and ready.")
         }
+        val coordinator = checkNotNull(generation.migrations)
+        // A failed startup run keeps the gate closed for this generation and closes access through CMI, once, as an outage does.
+        coordinator.startup.thenAccept { succeeded -> if (succeeded) gate.open() else fallback.startupFailed() }
+        // The first tick comes after every plugin has enabled, so every plugin has had its chance to register.
+        server.scheduler.runTask(this, Runnable { coordinator.registrationClosed() })
     }
 
     override fun onDisable() {
@@ -46,5 +60,14 @@ open class SneakyDB : JavaPlugin() {
         healthWorker = null
         session?.close()
         session = null
+    }
+}
+
+/** Refuses logins while [gate] is closed. Lowest priority, so later handlers can see the login is already refused. */
+internal class LoginGateListener(private val gate: LoginGate) : Listener {
+    @EventHandler(priority = EventPriority.LOWEST)
+    fun onPreLogin(event: AsyncPlayerPreLoginEvent) {
+        val refusal = gate.refusal() ?: return
+        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, Component.text(refusal))
     }
 }

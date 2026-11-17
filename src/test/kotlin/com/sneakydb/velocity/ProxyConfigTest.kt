@@ -41,6 +41,20 @@ class ProxyConfigTest {
         assertEquals(fromPaper.settings, fromProxy.settings)
     }
 
+    @Test fun `proxy default has exactly the Paper migrations keys and values`(@TempDir directory: Path) {
+        val paper = YamlConfiguration().apply { loadFromString(resource("config.yml")) }
+        val proxy = YamlConfigurationLoader.builder().buildAndLoadString(resource("velocity-config.yml")).node("migrations")
+        assertEquals(paper.getConfigurationSection("migrations")!!.getKeys(false), proxy.childrenMap().keys.map { it.toString() }.toSet())
+        val fromPaper = com.sneakydb.MigrationSettings.read({ paper.get("migrations.$it", null) }, logged::add)
+        ProxyConfig.load(directory) {}
+        val fromProxy = ProxyConfig.migrations(directory, logged::add)
+        assertEquals(fromPaper.mode, fromProxy.mode)
+        assertEquals(fromPaper.lockTimeoutSeconds, fromProxy.lockTimeoutSeconds)
+        assertEquals(fromPaper.loginMessage, fromProxy.loginMessage)
+        assertEquals(com.sneakydb.MigrationSettings.DEFAULT_LOGIN_MESSAGE, fromProxy.loginMessage)
+        assertTrue(logged.isEmpty())
+    }
+
     @Test fun `values parse with Paper's defaults, coercion and bounds`(@TempDir directory: Path) {
         Files.writeString(directory.resolve("config.yml"), """
             database:

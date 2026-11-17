@@ -58,6 +58,26 @@ class ReadinessLoggingTest {
         assertTrue(records.isEmpty(), "readiness succeeded; a transaction cut short by shutdown logs nothing")
     }
 
+    @Test fun `migrations leave readiness logging unchanged and log failed plugins separately`() {
+        val worker = DatabaseSessionTest.Worker()
+        val migrationLines = mutableListOf<String>()
+        val failed = DatabaseSession(worker, null, { s ->
+            MigrationCoordinator(MigrationSettings.DEFAULTS, MigrationCoordinatorTest.FakeStore(), s::whenReady, migrationLines::add,
+                migrationLines::add, MigrationCoordinatorTest.Inline())
+        }) { error("password=secret") }
+        failed.whenReady().whenComplete { _, failure -> logReadinessFailure(logger, failure) }
+        val plots = failed.migrate("plots", ReadinessLoggingTest::class.java)
+        worker.runNext()
+        failed.migrations!!.registrationClosed()
+        assertEquals(listOf("SneakyDB initialization failed during adapter creation; check adapter configuration and database access"),
+            records.map { it.message }, "still one readiness line")
+        assertTrue(plots.isCompletedExceptionally)
+        assertEquals("Migrations for plots failed: SneakyDB initialization failed during adapter creation; check adapter configuration and database access",
+            migrationLines.first())
+        assertTrue(migrationLines.none { "secret" in it })
+        failed.close()
+    }
+
     @Test fun `unknown error text and driver causes are never logged`() {
         logReadinessFailure(logger, java.util.concurrent.CompletionException(
             IllegalStateException("password=secret", RuntimeException("private driver cause"))))

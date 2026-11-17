@@ -1,0 +1,316 @@
+package com.sneakydb
+
+import com.sneakydb.MigrationScriptsTest.Companion.scripts
+import com.sneakydb.adapter.DatabaseSettings
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.*
+import org.junit.jupiter.api.Assumptions.assumeTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CompletionException
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+/**
+ * Runs only against a disposable PostgreSQL named by SNEAKYDB_TEST_PG_HOST (plus optional _PORT, _DB, _USER,
+ * _PASSWORD), like [PostgreSqlTransactionTest]. The user must be allowed to create databases: each test gets a new
+ * database, so the `sneakydb` schema starts out as each test needs it, and drops it afterwards.
+ */
+class PostgreSqlMigrationTest {
+    private val env = System.getenv()
+    private val admin = env["SNEAKYDB_TEST_PG_HOST"]?.let { host ->
+        DatabaseSettings(
+            host, env["SNEAKYDB_TEST_PG_PORT"]?.toInt() ?: 5432, env["SNEAKYDB_TEST_PG_DB"] ?: "postgres",
+            env["SNEAKYDB_TEST_PG_USER"] ?: "postgres", env["SNEAKYDB_TEST_PG_PASSWORD"] ?: "test", 2, 5000,
+        )
+    }
+    private val database = "sneakydb_migration_test_${System.nanoTime()}"
+    private val settings get() = admin!!.copy(database = database)
+    private val sessions = mutableListOf<DatabaseSession>()
+    private val info = CopyOnWriteArrayList<String>()
+    private val severe = CopyOnWriteArrayList<String>()
+
+    private fun connect(name: String = database) =
+        java.sql.DriverManager.getConnection("jdbc:postgresql://${admin!!.host}:${admin.port}/$name", admin.username, admin.password)
+
+    private fun sql(statement: String) = connect().use { c -> c.createStatement().use { it.execute(statement) } }
+
+    private fun <T> rows(query: String, read: (java.sql.ResultSet) -> T): List<T> =
+        connect().use { c -> c.createStatement().use { s -> s.executeQuery(query).use { r -> buildList { while (r.next()) add(read(r)) } } } }
+
+    private fun versions(): List<String> =
+        rows("select plugin || ':' || version from sneakydb.schema_migrations order by applied_at, plugin, version") { it.getString(1) }
+
+    private fun exists(relation: String) = rows("select to_regclass('$relation') is not null") { it.getBoolean(1) }.single()
+
+    @BeforeEach fun createDatabase() {
+        assumeTrue(admin != null, "SNEAKYDB_TEST_PG_HOST not set")
+        connect(admin!!.database).use { c -> c.createStatement().use { it.execute("create database $database") } }
+        sql("create schema sneakydb")
+    }
+
+    @AfterEach fun dropDatabase() {
+        if (admin == null) return
+        sessions.forEach { it.close() }
+        Thread.sleep(200) // pool closure runs on its own thread
+        connect(admin.database).use { c -> c.createStatement().use { it.execute("drop database if exists $database with (force)") } }
+    }
+
+    private fun session(mode: MigrationMode = MigrationMode.APPLY, lockTimeout: Int = 10): MigrationCoordinator {
+        val session = startDatabaseSession(DatabaseConfig("postgresql", settings), MigrationSettings(mode, lockTimeout, "starting"), info::add, severe::add) {}
+        sessions.add(session)
+        return session.migrations!!
+    }
+
+    private fun MigrationCoordinator.add(plugin: String, vararg files: Pair<String, String>): CompletableFuture<Int> =
+        register(plugin) { scripts(plugin, *files) }
+
+    private fun failure(future: CompletableFuture<*>): String {
+        runCatching { future.get(30, TimeUnit.SECONDS) }
+        return assertThrows(CompletionException::class.java) { future.join() }.cause!!.message!!
+    }
+
+    private fun CompletableFuture<Int>.await() = get(30, TimeUnit.SECONDS)
+
+    private val plotsScripts = arrayOf(
+        "V001__init.sql" to "create table plots (id integer primary key, owner text);\ncreate index plots_owner on plots (owner);\n",
+        "V002__seed.sql" to "insert into plots values (1, 'a');\r\ninsert into plots values (2, 'b');\r\n",
+    )
+
+    @Test fun `apply from empty creates the version table and records every script`() {
+        assertFalse(exists("sneakydb.schema_migrations"))
+        val coordinator = session()
+        val plots = coordinator.add("plots", *plotsScripts)
+        coordinator.registrationClosed()
+        assertEquals(2, plots.await())
+        assertTrue(coordinator.startup.get(30, TimeUnit.SECONDS))
+        assertEquals(listOf("plots:1", "plots:2"), versions())
+        assertEquals(listOf(2), rows("select count(*) from plots") { it.getInt(1) })
+        val stored = rows("select name, checksum from sneakydb.schema_migrations order by version") { it.getString(1) to it.getString(2) }
+        assertEquals(listOf("V001__init.sql", "V002__seed.sql"), stored.map { it.first })
+        assertEquals(scripts("plots", *plotsScripts).map { it.checksum }, stored.map { it.second })
+        assertTrue(info.any { it.startsWith("Applied migration plots:V001__init.sql in ") })
+        assertTrue(severe.isEmpty(), severe.toString())
+    }
+
+    @Test fun `a restart with nothing pending changes nothing`() {
+        val first = session()
+        val initial = first.add("plots", *plotsScripts)
+        first.registrationClosed()
+        initial.await()
+        val before = rows("select version, applied_at from sneakydb.schema_migrations order by version") { it.getInt(1) to it.getTimestamp(2) }
+        info.clear()
+        val second = session()
+        val again = second.add("plots", *plotsScripts)
+        second.registrationClosed()
+        assertEquals(2, again.await())
+        assertEquals(before, rows("select version, applied_at from sneakydb.schema_migrations order by version") { it.getInt(1) to it.getTimestamp(2) })
+        assertTrue(info.last().contains("0 scripts applied, 1 of 1 plugins ready"), info.last())
+    }
+
+    @Test fun `a failing script is rolled back entirely and reports PostgreSQL's SQL state`() {
+        val coordinator = session()
+        val plots = coordinator.add("plots",
+            "V001__init.sql" to "create table plots (id integer primary key);",
+            "V002__broken.sql" to "create table plot_notes (id integer);\ninsert into plots values (1);\ninsert into missing_table values (1);",
+            "V003__later.sql" to "create table plot_later (id integer);",
+        )
+        coordinator.registrationClosed()
+        val message = failure(plots)
+        assertTrue(message.startsWith("Migrations for plots failed at V002__broken.sql: SQL state 42P01: ERROR: relation \"missing_table\" does not exist"), message)
+        assertEquals(listOf(message), severe)
+        assertEquals(listOf("plots:1"), versions())
+        assertFalse(exists("plot_notes"), "the script's earlier statements were rolled back")
+        assertEquals(listOf(0), rows("select count(*) from plots") { it.getInt(1) })
+        assertFalse(exists("plot_later"), "later scripts were skipped")
+        assertFalse(coordinator.startup.get(30, TimeUnit.SECONDS))
+    }
+
+    @Test fun `session settings a script changes don't leak into the pool`() {
+        val coordinator = session()
+        val plots = coordinator.add("plots", "V001__init.sql" to "set search_path = pg_catalog;\nset application_name = 'migrated';\ncreate table public.plots (id int);")
+        coordinator.registrationClosed()
+        plots.await()
+        val session = sessions.single()
+        // The pool has two connections; ask both.
+        val seen = (1..4).map { session.query("select current_setting('search_path') as path", emptyList<Any>()).get(10, TimeUnit.SECONDS).single()["path"] }
+        assertTrue(seen.none { it == "pg_catalog" }, seen.toString())
+    }
+
+    private val alphaScripts = arrayOf(
+        "V001__owners.sql" to "create table alpha_owner (id integer primary key);",
+        "V002__drop_key.sql" to "-- requires: beta >= 1\nalter table beta_item drop constraint beta_item_owner_fk;\nalter table alpha_owner alter column id type bigint;",
+        "V003__restore_key.sql" to "-- requires: beta >= 2\nalter table beta_item add constraint beta_item_owner_fk foreign key (owner) references alpha_owner (id);",
+    )
+    private val betaScripts = arrayOf(
+        "V001__items.sql" to "-- requires: alpha >= 1\ncreate table beta_item (id integer primary key, owner integer constraint beta_item_owner_fk references alpha_owner (id));",
+        "V002__retype.sql" to "-- requires: alpha >= 2\nalter table beta_item alter column owner type bigint;",
+    )
+
+    private fun columnType(table: String, column: String) =
+        rows("select data_type from information_schema.columns where table_name = '$table' and column_name = '$column'") { it.getString(1) }.single()
+
+    @Test fun `two plugins change a shared relation in interleaved steps`() {
+        val coordinator = session()
+        val beta = coordinator.add("beta", *betaScripts)
+        val alpha = coordinator.add("alpha", *alphaScripts)
+        coordinator.registrationClosed()
+        assertEquals(3, alpha.await())
+        assertEquals(2, beta.await())
+        assertEquals(listOf("alpha:1", "beta:1", "alpha:2", "beta:2", "alpha:3"), versions())
+        assertEquals("bigint", columnType("beta_item", "owner"))
+        assertEquals(listOf(true), rows("select exists (select 1 from pg_constraint where conname = 'beta_item_owner_fk')") { it.getBoolean(1) })
+    }
+
+    @Test fun `merging only one side of the interleaved change runs nothing of it`() {
+        val first = session()
+        val alpha1 = first.add("alpha", alphaScripts[0])
+        val beta1 = first.add("beta", betaScripts[0])
+        first.registrationClosed()
+        alpha1.await(); beta1.await()
+
+        val onlyAlpha = session()
+        val alpha = onlyAlpha.add("alpha", *alphaScripts)
+        val beta = onlyAlpha.add("beta", betaScripts[0])
+        val other = onlyAlpha.add("other", "V001__x.sql" to "create table other_table (id int);")
+        onlyAlpha.registrationClosed()
+        assertTrue(failure(alpha).contains("needs requires: beta >= 2"))
+        assertEquals(1, beta.await())
+        assertEquals(1, other.await())
+        assertEquals(listOf("alpha:1", "beta:1", "other:1"), versions().sorted())
+        assertEquals("integer", columnType("alpha_owner", "id"), "alpha 2 did not run")
+        assertFalse(onlyAlpha.startup.get(30, TimeUnit.SECONDS))
+
+        val onlyBeta = session()
+        val alphaOld = onlyBeta.add("alpha", alphaScripts[0])
+        val betaNew = onlyBeta.add("beta", *betaScripts)
+        onlyBeta.registrationClosed()
+        assertEquals(1, alphaOld.await())
+        assertTrue(failure(betaNew).contains("needs requires: alpha >= 2"))
+        assertEquals("integer", columnType("beta_item", "owner"), "beta 2 did not run")
+    }
+
+    @Test fun `two servers racing on one database apply every script exactly once`() {
+        val left = session()
+        val right = session()
+        val futures = listOf(left, right).flatMap { coordinator ->
+            listOf(coordinator.add("alpha", *alphaScripts), coordinator.add("beta", *betaScripts), coordinator.add("plots", *plotsScripts))
+        }
+        val start = CountDownLatch(1)
+        val threads = listOf(left, right).map { coordinator -> Thread { start.await(); coordinator.registrationClosed() }.apply { start() } }
+        start.countDown()
+        threads.forEach { it.join() }
+        assertEquals(listOf(3, 2, 2, 3, 2, 2), futures.map { it.await() })
+        val recorded = versions()
+        assertEquals(7, recorded.size)
+        assertEquals(recorded.toSet().size, recorded.size, "no script recorded twice")
+        assertEquals(listOf(2), rows("select count(*) from plots") { it.getInt(1) }, "seed inserted once")
+        assertTrue(severe.isEmpty(), severe.toString())
+        assertTrue(listOf(left, right).all { it.startup.get(30, TimeUnit.SECONDS) })
+    }
+
+    @Test fun `an operator row with a null checksum counts as applied and gets the checksum in apply mode`() {
+        sql("create table plots (id integer primary key, owner text)")
+        sql("""create table sneakydb.schema_migrations (plugin text not null, version integer not null, name text not null,
+               checksum text, applied_at timestamptz not null default now(), primary key (plugin, version))""")
+        sql("insert into sneakydb.schema_migrations (plugin, version, name) values ('plots', 1, 'existing tables')")
+
+        val verify = session(MigrationMode.VERIFY)
+        val verified = verify.add("plots", plotsScripts[0])
+        verify.registrationClosed()
+        assertEquals(1, verified.await())
+        assertEquals(listOf<String?>(null), rows("select checksum from sneakydb.schema_migrations") { it.getString(1) }, "verify writes nothing")
+
+        val apply = session()
+        val applied = apply.add("plots", *plotsScripts)
+        apply.registrationClosed()
+        assertEquals(2, applied.await(), "V001 was not run again (its create table would fail)")
+        assertEquals(scripts("plots", *plotsScripts).map { it.checksum },
+            rows("select checksum from sneakydb.schema_migrations order by version") { it.getString(1) })
+    }
+
+    @Test fun `verify mode fails pending plugins and leaves the database untouched`() {
+        val coordinator = session(MigrationMode.VERIFY)
+        val plots = coordinator.add("plots", *plotsScripts)
+        coordinator.registrationClosed()
+        assertTrue(failure(plots).contains("not applied, and this server runs migrations in verify mode"))
+        assertFalse(exists("sneakydb.schema_migrations"), "verify mode does not create the table")
+        assertFalse(exists("plots"))
+    }
+
+    @Test fun `the database being newer than the build fails the plugin`() {
+        val first = session()
+        first.add("plots", *plotsScripts).also { first.registrationClosed() }.await()
+        val older = session()
+        val plots = older.add("plots", plotsScripts[0])
+        older.registrationClosed()
+        assertTrue(failure(plots).contains("the database is newer than this build"))
+    }
+
+    @Test fun `an edited script fails its plugin`() {
+        val first = session()
+        first.add("plots", *plotsScripts).also { first.registrationClosed() }.await()
+        val edited = session()
+        val plots = edited.add("plots", plotsScripts[0], "V002__seed.sql" to "insert into plots values (3, 'c');")
+        edited.registrationClosed()
+        assertTrue(failure(plots).contains("V002__seed.sql differs from the script that was applied"))
+    }
+
+    @Test fun `a script waiting too long for a lock fails instead of freezing`() {
+        sql("create table busy (id int)")
+        connect().use { holder ->
+            holder.autoCommit = false
+            holder.createStatement().use { it.execute("lock table busy in access exclusive mode") }
+            val coordinator = session(lockTimeout = 1)
+            val plots = coordinator.add("plots", "V001__alter.sql" to "alter table busy add column name text;")
+            coordinator.registrationClosed()
+            assertTrue(failure(plots).contains("SQL state 55P03"))
+            holder.rollback()
+        }
+        assertEquals(emptyList<String>(), versions())
+    }
+
+    @Test fun `a missing sneakydb schema fails every plugin with the statements to run`() {
+        sql("drop schema sneakydb")
+        for (mode in MigrationMode.entries) {
+            val coordinator = session(mode)
+            val plots = coordinator.add("plots", *plotsScripts)
+            val other = coordinator.add("other", "V1__x.sql" to "select 1;")
+            coordinator.registrationClosed()
+            for (future in listOf(plots, other)) {
+                val message = failure(future)
+                assertTrue(message.contains("the schema sneakydb does not exist; as the database owner run: create schema sneakydb; " +
+                    "grant usage, create on schema sneakydb to ${admin!!.username};"), message)
+            }
+        }
+        assertEquals(listOf(false), rows("select exists (select 1 from pg_namespace where nspname = 'sneakydb')") { it.getBoolean(1) })
+        assertFalse(exists("plots"))
+    }
+
+    @Test fun `a role that may not use the schema is told what to grant`() {
+        sql("create role sneakydb_limited login password 'limited'")
+        try {
+            sql("grant connect on database $database to sneakydb_limited")
+            val limited = settings.copy(username = "sneakydb_limited", password = "limited")
+            val session = startDatabaseSession(DatabaseConfig("postgresql", limited), MigrationSettings.DEFAULTS, info::add, severe::add) {}
+            sessions.add(session)
+            val coordinator = session.migrations!!
+            val plots = coordinator.add("plots", *plotsScripts)
+            coordinator.registrationClosed()
+            val message = failure(plots)
+            assertTrue(message.contains("role sneakydb_limited may not use the schema sneakydb; as the database owner run: " +
+                "grant usage, create on schema sneakydb to sneakydb_limited;"), message)
+            assertTrue((info + severe).none { "limited'" in it || "password" in it })
+        } finally {
+            sessions.forEach { it.close() }
+            sessions.clear()
+            Thread.sleep(200)
+            connect(admin!!.database).use { c -> c.createStatement().use { it.execute("drop database if exists $database with (force)") } }
+            sql2("drop role if exists sneakydb_limited")
+        }
+    }
+
+    private fun sql2(statement: String) = connect(admin!!.database).use { c -> c.createStatement().use { it.execute(statement) } }
+}

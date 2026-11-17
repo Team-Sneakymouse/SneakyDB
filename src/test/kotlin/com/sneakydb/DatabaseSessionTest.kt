@@ -403,6 +403,35 @@ class DatabaseSessionTest {
         assertThrows(UnsupportedOperationException::class.java) { session.listen("pushes", java.util.function.Consumer {}) }
     }
 
+    @Test fun `migrate registers with this generation's coordinator, which shutdown closes`() {
+        val worker = Worker()
+        val store = MigrationCoordinatorTest.FakeStore()
+        val session = DatabaseSession(worker, null, { s ->
+            MigrationCoordinator(MigrationSettings.DEFAULTS, store, s::whenReady, {}, {}, MigrationCoordinatorTest.Inline())
+        }) { Pool() }
+        val pending = session.migrate("plots", DatabaseSessionTest::class.java)
+        assertFalse(pending.isDone, "registration waits for the startup run")
+        session.close()
+        val error = assertThrows(java.util.concurrent.CompletionException::class.java) { pending.join() }
+        assertEquals("SneakyDB has shut down", error.cause?.message)
+        assertTrue(session.migrate("plots", DatabaseSessionTest::class.java).isCompletedExceptionally)
+        assertTrue(store.modes.isEmpty(), "nothing ran")
+
+        val without = DatabaseSession(Worker()) { Pool() }
+        val unsupported = assertThrows(java.util.concurrent.CompletionException::class.java) { without.migrate("plots", DatabaseSessionTest::class.java).join() }
+        assertInstanceOf(UnsupportedOperationException::class.java, unsupported.cause)
+    }
+
+    @Test fun `the API's default migrate is unsupported for existing implementations`() {
+        val double = object : SneakyDBApi {
+            override fun query(sql: String, parameters: List<*>) = TODO()
+            override fun execute(sql: String, parameters: List<*>) = TODO()
+            override fun whenReady() = TODO()
+            override fun isAvailable() = false
+        }
+        assertThrows(UnsupportedOperationException::class.java) { double.migrate("plots", DatabaseSessionTest::class.java) }
+    }
+
     @Test fun `workers resolve the bundled driver through SneakyDB's own loader`() {
         val thread = workerThreads.newThread {}
         assertSame(DatabaseSession::class.java.classLoader, thread.contextClassLoader)

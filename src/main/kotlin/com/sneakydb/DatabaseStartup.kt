@@ -50,8 +50,17 @@ internal val workerThreads = ThreadFactory { task ->
     }
 }
 
-/** Starts one enable generation. A null [config] (unreadable file) fails readiness during adapter creation. */
-internal fun startDatabaseSession(config: DatabaseConfig?, warn: (String) -> Unit): DatabaseSession {
+/**
+ * Starts one enable generation. A null [config] (unreadable file) fails readiness during adapter creation. The session
+ * runs migrations with [migrations]; [info] and [severe] (default: [warn]) receive their log lines.
+ */
+internal fun startDatabaseSession(
+    config: DatabaseConfig?,
+    migrations: MigrationSettings = MigrationSettings.DEFAULTS,
+    info: (String) -> Unit = {},
+    severe: ((String) -> Unit)? = null,
+    warn: (String) -> Unit,
+): DatabaseSession {
     val executor = ThreadPoolExecutor(
         4, 4, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(256), workerThreads, ThreadPoolExecutor.AbortPolicy(),
     )
@@ -59,7 +68,10 @@ internal fun startDatabaseSession(config: DatabaseConfig?, warn: (String) -> Uni
         { openPostgreSqlNotificationConnection(checkNotNull(config) { UNREADABLE_CONFIG }.settings) },
         warn,
     )
-    return DatabaseSession(executor, notifications) {
+    val coordinator = { session: DatabaseSession ->
+        MigrationCoordinator(migrations, PostgreSqlMigrationStore(session), session::whenReady, info, severe ?: warn)
+    }
+    return DatabaseSession(executor, notifications, coordinator) {
         checkNotNull(config) { UNREADABLE_CONFIG }
         require(config.adapterId == "postgresql") { "Unsupported database adapter" }
         PostgreSqlAdapter().createDataSource(config.settings)

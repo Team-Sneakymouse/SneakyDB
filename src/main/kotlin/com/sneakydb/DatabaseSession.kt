@@ -12,6 +12,7 @@ import java.util.concurrent.ExecutorService
 internal class DatabaseSession(
     private val executor: ExecutorService,
     private val notifications: NotificationWorker? = null,
+    migrations: ((DatabaseSession) -> MigrationCoordinator)? = null,
     createSource: () -> HikariDataSource,
 ) : SneakyDBApi {
     private val lock = Any()
@@ -22,6 +23,8 @@ internal class DatabaseSession(
     private val operations = HashSet<CompletableFuture<*>>()
     /** Set on a worker while it runs a transaction, to reject calls that would need a second connection. */
     private val insideTransaction = ThreadLocal<Boolean>()
+    /** This generation's migrations; null in sessions built without them (tests). */
+    internal val migrations: MigrationCoordinator? = migrations?.invoke(this)
 
     init {
         executor.execute {
@@ -46,6 +49,10 @@ internal class DatabaseSession(
             }
         }
     }
+
+    override fun migrate(plugin: String, anchor: Class<*>): CompletableFuture<Int> =
+        migrations?.register(plugin, anchor)
+            ?: CompletableFuture.failedFuture(UnsupportedOperationException("This SneakyDB session does not run migrations"))
 
     override fun whenReady(): CompletableFuture<Void> = ready.copy()
     override fun isAvailable(): Boolean = synchronized(lock) { source != null && !stopped }
@@ -124,6 +131,7 @@ internal class DatabaseSession(
         val error = IllegalStateException("SneakyDB has shut down")
         ready.completeExceptionally(error)
         pending.forEach { it.completeExceptionally(error) }
+        migrations?.close()
         executor.shutdownNow()
         notifications?.close()
         closing?.let { pool -> Thread({ pool.close() }, "SneakyDB-Close").apply { isDaemon = true }.start() }

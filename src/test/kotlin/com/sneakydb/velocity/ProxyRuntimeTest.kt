@@ -67,3 +67,64 @@ class ProxyRuntimeTest {
         assertTrue(info.isEmpty() && warn.isEmpty() && severe.isEmpty())
     }
 }
+
+class ProxyLoginGateTest {
+    private val severe = CopyOnWriteArrayList<String>()
+    private fun runtime(directory: Path) = ProxyRuntime(directory, {}, {}, severe::add)
+
+    private fun unreachable(directory: Path, extra: String = "") {
+        val closedPort = java.net.ServerSocket(0).use { it.localPort }
+        Files.writeString(directory.resolve("config.yml"), "database:\n  host: 127.0.0.1\n  port: $closedPort\n  connection-timeout-ms: 250\n$extra")
+    }
+
+    private fun awaitOpen(runtime: ProxyRuntime) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (runtime.loginRefusal() != null && System.nanoTime() < deadline) Thread.sleep(5)
+    }
+
+    @Test fun `logins are refused until proxy initialisation has finished and nothing is pending`(@TempDir directory: Path) {
+        unreachable(directory, "migrations:\n  login-message: Proxy starting\n")
+        val runtime = runtime(directory)
+        assertEquals(com.sneakydb.MigrationSettings.DEFAULT_LOGIN_MESSAGE, runtime.loginRefusal(), "refused before start")
+        runtime.start()
+        try {
+            assertEquals("Proxy starting", runtime.loginRefusal())
+            runtime.initialized()
+            awaitOpen(runtime)
+            assertNull(runtime.loginRefusal(), "no plugin registered: open as soon as that is known")
+        } finally { runtime.stop() }
+    }
+
+    @Test fun `a failed startup run keeps the proxy closed`(@TempDir directory: Path) {
+        unreachable(directory)
+        val runtime = runtime(directory)
+        runtime.start()
+        try {
+            val migration = SneakyDBProvider.getApi().migrate("proxyplugin", ProxyLoginGateTest::class.java)
+            runtime.initialized()
+            assertThrows(ExecutionException::class.java) { migration.get(10, TimeUnit.SECONDS) }
+            Thread.sleep(50)
+            assertEquals(com.sneakydb.MigrationSettings.DEFAULT_LOGIN_MESSAGE, runtime.loginRefusal())
+            assertTrue(severe.any { it.startsWith("Migrations for proxyplugin failed: SneakyDB initialization failed during connection acquisition") }, severe.toString())
+        } finally { runtime.stop() }
+    }
+
+    @Test fun `the PreLoginEvent handler denies with the refusal and leaves logins alone once open`(@TempDir directory: Path) {
+        unreachable(directory, "migrations:\n  login-message: Proxy starting\n")
+        val plugin = SneakyDBVelocity(org.slf4j.helpers.NOPLogger.NOP_LOGGER, directory)
+        val connection = java.lang.reflect.Proxy.newProxyInstance(javaClass.classLoader,
+            arrayOf(com.velocitypowered.api.proxy.InboundConnection::class.java)) { _, method, _ -> error(method.name) }
+            as com.velocitypowered.api.proxy.InboundConnection
+        fun login() = com.velocitypowered.api.event.connection.PreLoginEvent(connection, "player").also { plugin.onPreLogin(it) }.result
+        plugin.onProxyInitialize(com.velocitypowered.api.event.proxy.ProxyInitializeEvent())
+        try {
+            val refused = login()
+            assertFalse(refused.isAllowed)
+            assertEquals(net.kyori.adventure.text.Component.text("Proxy starting"), refused.reasonComponent.get())
+            plugin.onProxyInitialized(com.velocitypowered.api.event.proxy.ProxyInitializeEvent())
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (!login().isAllowed && System.nanoTime() < deadline) Thread.sleep(5)
+            assertTrue(login().isAllowed)
+        } finally { plugin.onProxyShutdown(com.velocitypowered.api.event.proxy.ProxyShutdownEvent()) }
+    }
+}

@@ -5,9 +5,7 @@ internal class OutageFallback(
     private val onMain: (() -> Unit) -> Unit,
     private val command: (String) -> Unit,
 ) {
-    private val message = message.takeIf {
-        it.isNotBlank() && it.length <= 512 && it.none(Char::isISOControl)
-    } ?: "Database unavailable. Please try again later."
+    private val message = playerMessage(message, "Database unavailable. Please try again later.")
     private val stopped = java.util.concurrent.atomic.AtomicBoolean()
     fun close() { stopped.set(true) }
     private val activated = java.util.concurrent.atomic.AtomicBoolean()

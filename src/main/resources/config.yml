@@ -14,3 +14,12 @@ maintenance:
   message: 'Database unavailable. Please try again later.'
   # Delay after each completed check; clamped to 5–300 seconds.
   health-check-interval-seconds: 30
+
+migrations:
+  # apply: run pending scripts. verify: never change the database; a plugin whose scripts are not all applied fails.
+  # Run apply on one server per database and verify on the others. Anything else than apply or verify means verify.
+  mode: apply
+  # How long a script waits for a table lock before it fails; clamped to 1–300 seconds.
+  lock-timeout-seconds: 10
+  # Shown to players who try to join while migrations run or after one failed.
+  login-message: 'The server is starting. Please try again in a moment.'
