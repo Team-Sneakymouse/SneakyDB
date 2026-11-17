@@ -1,24 +1,26 @@
 package com.sneakydb
 
+import java.util.concurrent.CancellationException
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CompletionException
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
-// Plugin-owned migrations: registration, the startup run, late batches and the login gate. No platform types here.
+// Plugin-owned migrations: registration, the startup run and late batches. No platform types here.
 
 /** The `migrations:` config section, read with the same rules on Paper and Velocity. */
-internal class MigrationSettings(val mode: MigrationMode, val lockTimeoutSeconds: Int, val loginMessage: String) {
+internal class MigrationSettings(val mode: MigrationMode, val lockTimeoutSeconds: Int) {
     companion object {
-        const val DEFAULT_LOGIN_MESSAGE = "The server is starting. Please try again in a moment."
-        val DEFAULTS = MigrationSettings(MigrationMode.APPLY, 10, DEFAULT_LOGIN_MESSAGE)
+        val DEFAULTS = MigrationSettings(MigrationMode.APPLY, 10)
 
         /**
          * [value] returns the raw value under `migrations.<key>`, or null when absent. A missing mode means apply; an
-         * unknown one means verify, with a warning, so a typo never lets a server write to the database.
+         * unknown one means verify, with a warning, so a typo never lets a server write to the database. Keys that
+         * older versions read (`login-message`) are ignored.
          */
         fun read(value: (String) -> Any?, warn: (String) -> Unit): MigrationSettings {
             val rawMode = value("mode")?.toString()?.trim()?.lowercase()
@@ -27,11 +29,7 @@ internal class MigrationSettings(val mode: MigrationMode, val lockTimeoutSeconds
                 "verify" -> MigrationMode.VERIFY
                 else -> MigrationMode.VERIFY.also { warn("migrations.mode must be apply or verify; running in verify mode") }
             }
-            return MigrationSettings(
-                mode,
-                ((value("lock-timeout-seconds") as? Number)?.toInt() ?: 10).coerceIn(1, 300),
-                playerMessage(value("login-message")?.toString(), DEFAULT_LOGIN_MESSAGE),
-            )
+            return MigrationSettings(mode, ((value("lock-timeout-seconds") as? Number)?.toInt() ?: 10).coerceIn(1, 300))
         }
     }
 }
@@ -56,7 +54,8 @@ internal interface MigrationStore {
 
     /**
      * Applies [step] and records its version in one transaction, under the migration lock and after re-checking what is
-     * applied ([recheckStep]). Returns false when another server applied it in the meantime.
+     * applied ([recheckStep]). Returns false when another server applied it in the meantime. Throws
+     * [ScriptFailedException] for a failure once the script had started; any other exception means it never started.
      */
     fun apply(step: PlannedStep, lockTimeoutSeconds: Int): Boolean
 
@@ -64,12 +63,39 @@ internal interface MigrationStore {
     fun confirmReady(plugin: String, scripts: List<MigrationScript>)
 }
 
-/** Refuses logins from SneakyDB's enable until the startup migration run has finished without failures. */
-internal class LoginGate(val message: String) {
-    @Volatile private var closed = true
-    fun open() { closed = false }
-    /** Null when logins are allowed, otherwise the message to refuse them with. */
-    fun refusal(): String? = if (closed) message else null
+/** How the startup run ended. The platform decides from it whether its startup continues. */
+internal enum class StartupOutcome {
+    /** No plugin failed, or there was nothing to run. */
+    CLEAN,
+
+    /** Some plugins failed before any of their scripts ran, so the database is unchanged by them; the others migrated. */
+    PLUGINS_FAILED,
+
+    /** A script failed while running: no further script ran, and every plugin not completed by then failed. */
+    STOPPED,
+}
+
+/**
+ * Blocks the calling platform thread (Paper's server thread, Velocity's initialisation) until [startup] completes, and
+ * returns its outcome; null when SneakyDB shut down first. Interrupts don't end the wait; they are kept for the caller.
+ */
+internal fun awaitStartup(startup: CompletableFuture<StartupOutcome>): StartupOutcome? {
+    var interrupted = false
+    try {
+        while (true) {
+            try {
+                return startup.get()
+            } catch (_: InterruptedException) {
+                interrupted = true
+            } catch (_: ExecutionException) {
+                return null
+            } catch (_: CancellationException) {
+                return null
+            }
+        }
+    } finally {
+        if (interrupted) Thread.currentThread().interrupt()
+    }
 }
 
 internal fun migrationThread(): ExecutorService = ThreadPoolExecutor(1, 1, 30, TimeUnit.SECONDS, LinkedBlockingQueue()) { task ->
@@ -80,11 +106,12 @@ internal fun migrationThread(): ExecutorService = ThreadPoolExecutor(1, 1, 30, T
 }.apply { allowCoreThreadTimeOut(true) }
 
 /**
- * One enable generation's migrations. [register] only records a plugin; [registrationClosed] (first tick on Paper,
- * after proxy initialisation on Velocity) starts the startup run. Later registrations wait in a queue; when the
- * executor gets to them, every registration queued by then forms one batch. Batches run one after another on
- * [executor]. [startup] completes with true once the startup run finished without a failed plugin, false otherwise; it
- * never completes normally after [close].
+ * One enable generation's migrations. [register] only records a plugin; [registrationClosed] starts the run of
+ * everything registered so far: the startup run (Paper: `ServerLoadEvent` at startup; Velocity: the end of proxy
+ * initialisation), whose outcome [startup] reports and which the platform waits for. Later registrations wait in a
+ * queue; when the executor gets to them, every registration queued by then forms one late batch. Batches run one after
+ * another on [executor]. A script that fails while running stops its batch. [startup] never completes normally after
+ * [close].
  */
 internal class MigrationCoordinator(
     private val settings: MigrationSettings,
@@ -107,7 +134,7 @@ internal class MigrationCoordinator(
     private val pending = HashMap<String, Registration>()
     /** Every plugin that registered in this enable generation, with the reason its latest registration failed, if it did. */
     private val generation = HashMap<String, String?>()
-    val startup = CompletableFuture<Boolean>()
+    val startup = CompletableFuture<StartupOutcome>()
 
     fun register(plugin: String, anchor: Class<*>): CompletableFuture<Int> = register(plugin) { discoverMigrationScripts(plugin, anchor) }
 
@@ -155,15 +182,19 @@ internal class MigrationCoordinator(
         return result
     }
 
-    /** Every plugin has had its chance to register: start the startup run. Later calls do nothing. */
-    fun registrationClosed() {
+    /**
+     * Every plugin has had its chance to register: run what is registered. With [startupRun] that is the startup run,
+     * reported through [startup]; otherwise (SneakyDB enabled after the server started) it runs as a late batch and
+     * [startup] reports [StartupOutcome.CLEAN]. Only the first call does anything.
+     */
+    fun registrationClosed(startupRun: Boolean = true) {
         val batch = synchronized(lock) {
             if (!registering || stopped) return
             registering = false
             startupBatch.toList().also { startupBatch.clear() }
         }
-        if (batch.isEmpty()) startup.complete(true)
-        else submit(startupRun = true) { batch }
+        if (batch.isEmpty() || !startupRun) startup.complete(StartupOutcome.CLEAN)
+        if (batch.isNotEmpty()) submit(startupRun) { batch }
     }
 
     fun close() {
@@ -186,16 +217,17 @@ internal class MigrationCoordinator(
                 val batch = take()
                 if (batch.isEmpty()) return@execute
                 val label = if (startupRun) "startup" else "late registration of ${batch.joinToString { it.plugin }}"
-                var succeeded = false
+                // A run that broke without saying how far it got is treated like a script that failed while running.
+                var outcome = StartupOutcome.STOPPED
                 try {
-                    succeeded = runBatch(batch, label)
+                    outcome = runBatch(batch, label, startupRun)
                 } catch (error: Throwable) {
                     if (!isStopped) severe("Migrations ($label) stopped: ${describeFailure(error)}")
                 } finally {
                     // Never leave a future pending, even if the run itself broke.
                     val error = MigrationException("Migrations stopped before they finished; see the server log")
-                    batch.forEach { if (!it.result.isDone) { succeeded = false; it.result.completeExceptionally(error) } }
-                    if (startupRun) startup.complete(succeeded)
+                    batch.forEach { if (!it.result.isDone) { outcome = StartupOutcome.STOPPED; it.result.completeExceptionally(error) } }
+                    if (startupRun) startup.complete(outcome)
                 }
             }
         } catch (_: RejectedExecutionException) {
@@ -205,15 +237,15 @@ internal class MigrationCoordinator(
         }
     }
 
-    /** Runs one batch to the end; returns true when no plugin of the batch failed. */
-    private fun runBatch(batch: List<Registration>, label: String): Boolean {
+    /** Runs one batch until it ends or a script fails while running. */
+    private fun runBatch(batch: List<Registration>, label: String, startupRun: Boolean): StartupOutcome {
         val started = System.nanoTime()
         val run = BatchRun(batch.associateBy { it.plugin })
         try {
             ready().join()
         } catch (error: Throwable) {
             batch.forEach { run.fail(it.plugin, null, describeFailure(error)) }
-            return run.finish(label, started)
+            return run.finish(label, started, startupRun)
         }
         val discovered = batch.associate { registration ->
             registration.plugin to runCatching { registration.scripts() }.recoverCatching { error ->
@@ -225,7 +257,7 @@ internal class MigrationCoordinator(
             store.readApplied(settings.mode)
         } catch (error: Throwable) {
             batch.forEach { run.fail(it.plugin, null, describeFailure(error)) }
-            return run.finish(label, started)
+            return run.finish(label, started, startupRun)
         }
         // Plugins of other batches of this generation count as present, failed ones included. Those still pending
         // registered after this batch was put together: their version is not final until their own batch has run.
@@ -248,6 +280,7 @@ internal class MigrationCoordinator(
         val remaining = plan.steps.groupingBy { it.plugin }.eachCount().toMutableMap()
         plan.scripts.keys.filter { it !in remaining }.forEach { run.ready(it, plan) }
         for (step in plan.steps) {
+            if (isStopped) break
             if (step.key in run.skipped || step.plugin in run.failed) continue
             val begun = System.nanoTime()
             try {
@@ -259,6 +292,11 @@ internal class MigrationCoordinator(
                     info("Migration ${step.plugin}:${step.script.fileName} was already applied by another server.")
                 }
             } catch (error: Throwable) {
+                if (error is ScriptFailedException && !isStopped) {
+                    // Keep errors from compounding: nothing further of this batch runs.
+                    run.halt(step, describeFailure(error))
+                    break
+                }
                 run.fail(step.plugin, step.script.fileName, describeFailure(error))
                 run.skipFrom(step.key, plan, "${step.plugin}:${step.script.fileName}")
                 continue
@@ -266,7 +304,7 @@ internal class MigrationCoordinator(
             val left = remaining.merge(step.plugin, -1, Int::plus)!!
             if (left == 0) run.ready(step.plugin, plan)
         }
-        return run.finish(label, started)
+        return run.finish(label, started, startupRun)
     }
 
     /** Outcome bookkeeping of one batch. */
@@ -274,6 +312,8 @@ internal class MigrationCoordinator(
         val failed = LinkedHashSet<String>()
         val skipped = HashSet<StepKey>()
         private val completed = HashSet<String>()
+        /** The script that failed while running and stopped the batch. */
+        private var haltedAt: PlannedStep? = null
         var applied = 0
         var skippedByOthers = 0
 
@@ -291,7 +331,7 @@ internal class MigrationCoordinator(
             registrations[plugin]?.result?.complete(scripts.size)
         }
 
-        fun fail(plugin: String, script: String?, reason: String) {
+        fun fail(plugin: String, script: String?, reason: String, log: Boolean = true) {
             if (!failed.add(plugin)) return
             val registration = registrations[plugin] ?: return
             if (isStopped) {
@@ -299,8 +339,18 @@ internal class MigrationCoordinator(
                 return
             }
             val message = "Migrations for $plugin failed${script?.let { " at $it" } ?: ""}: $reason"
-            severe(message)
+            if (log) severe(message)
             registration.result.completeExceptionally(MigrationException(message))
+        }
+
+        /** [step] failed while running: fails its plugin and every plugin of the batch not completed yet. */
+        fun halt(step: PlannedStep, reason: String) {
+            fail(step.plugin, step.script.fileName, reason)
+            haltedAt = step
+            for (plugin in registrations.keys.sorted()) {
+                if (plugin in completed) continue
+                fail(plugin, null, "not completed, because $step failed while running and SneakyDB ran no further script", log = false)
+            }
         }
 
         /** Skips [failedStep], everything after it in its plugin and every step that depends on those. */
@@ -317,15 +367,27 @@ internal class MigrationCoordinator(
             }
         }
 
-        fun finish(label: String, started: Long): Boolean {
+        fun finish(label: String, started: Long, startupRun: Boolean): StartupOutcome {
             val millis = (System.nanoTime() - started) / 1_000_000
             val others = if (skippedByOthers > 0) " ($skippedByOthers already applied by another server)" else ""
-            val outcome = if (failed.isEmpty()) "" else "; failed: ${failed.joinToString()}"
+            val counts = "$applied scripts applied$others, ${completed.size} of ${registrations.size} plugins ready"
+            val halted = haltedAt
             if (!isStopped) {
-                info("Migrations ($label, ${settings.mode.name.lowercase()} mode): $applied scripts applied$others, " +
-                    "${completed.size} of ${registrations.size} plugins ready$outcome in $millis ms.")
+                val mode = "$label, ${settings.mode.name.lowercase()} mode"
+                if (halted != null) {
+                    severe("Migrations ($mode) stopped: $halted failed while running, so no further script ran; $counts; " +
+                        "failed: ${failed.joinToString()}" + (if (startupRun) ". The server stops so the error can't compound; " +
+                        "fix the cause logged above and start it again (each start retries the script)" else "") + " (in $millis ms).")
+                } else {
+                    val outcome = if (failed.isEmpty()) "" else "; failed: ${failed.joinToString()}"
+                    info("Migrations ($mode): $counts$outcome in $millis ms.")
+                }
             }
-            return failed.isEmpty() && !isStopped
+            return when {
+                halted != null -> StartupOutcome.STOPPED
+                failed.isEmpty() -> StartupOutcome.CLEAN
+                else -> StartupOutcome.PLUGINS_FAILED
+            }
         }
     }
 }

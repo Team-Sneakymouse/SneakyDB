@@ -16,5 +16,3 @@ migrations:
   mode: apply
   # How long a script waits for a table lock before it fails; clamped to 1–300 seconds.
   lock-timeout-seconds: 10
-  # Shown to players who try to join while migrations run or after one failed.
-  login-message: 'The server is starting. Please try again in a moment.'

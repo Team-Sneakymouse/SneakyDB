@@ -129,9 +129,10 @@ internal class DatabaseSession(
             (source to operations.toList()).also { source = null; operations.clear() }
         }
         val error = IllegalStateException("SneakyDB has shut down")
+        // Before readiness fails: a run waiting for readiness must see the shutdown, not report its plugins as failed.
+        migrations?.close()
         ready.completeExceptionally(error)
         pending.forEach { it.completeExceptionally(error) }
-        migrations?.close()
         executor.shutdownNow()
         notifications?.close()
         closing?.let { pool -> Thread({ pool.close() }, "SneakyDB-Close").apply { isDaemon = true }.start() }

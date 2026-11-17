@@ -1,12 +1,9 @@
 package com.sneakydb
 
-import io.papermc.paper.event.connection.PlayerConnectionValidateLoginEvent
-import net.kyori.adventure.text.Component
 import org.bukkit.event.EventHandler
 import org.bukkit.event.EventPriority
 import org.bukkit.event.Listener
-import org.bukkit.event.player.AsyncPlayerPreLoginEvent
-import org.bukkit.event.player.PlayerJoinEvent
+import org.bukkit.event.server.ServerLoadEvent
 import org.bukkit.plugin.java.JavaPlugin
 
 /** Paper entry point (paper-plugin.yml). The Velocity entry point is com.sneakydb.velocity.SneakyDBVelocity. */
@@ -20,9 +17,6 @@ open class SneakyDB : JavaPlugin() {
         // An explicit null default keeps Bukkit's getX(path, default) semantics: the jar's defaults don't apply.
         val database = DatabaseConfig.read { config.get("database.$it", null) }
         val migrations = MigrationSettings.read({ config.get("migrations.$it", null) }, logger::warning)
-        // Closed from here until the startup migration run has finished; Bukkit drops the listener on disable.
-        val gate = LoginGate(migrations.loginMessage)
-        server.pluginManager.registerEvents(LoginGateListener(gate), this)
         val settings = database.settings
         val generation = startDatabaseSession(database, migrations, logger::info, logger::severe, logger::warning)
         session = generation
@@ -48,10 +42,30 @@ open class SneakyDB : JavaPlugin() {
             else if (generation.isAvailable()) logger.info("PostgreSQL adapter connected and ready.")
         }
         val coordinator = checkNotNull(generation.migrations)
-        // A failed startup run keeps the gate closed for this generation and closes access through CMI, once, as an outage does.
-        coordinator.startup.thenAccept { succeeded -> if (succeeded) gate.open() else fallback.startupFailed() }
-        // The first tick comes after every plugin has enabled, so every plugin has had its chance to register.
-        server.scheduler.runTask(this, Runnable { coordinator.registrationClosed() })
+        // Bukkit drops the listener on disable.
+        server.pluginManager.registerEvents(StartupListener { holdStartup(coordinator, fallback) }, this)
+        // Enabled after the server started (re-enable, /reload): no ServerLoadEvent at startup comes, so what registers
+        // during this enable runs at the first tick as a late batch, without holding the server thread.
+        server.scheduler.runTask(this, Runnable { coordinator.registrationClosed(startupRun = false) })
+    }
+
+    /**
+     * On the server thread, after every plugin has enabled and before the server accepts connections: runs the startup
+     * migrations while the thread waits. Ends early when SneakyDB is disabled (on shutdown, Paper disables plugins from
+     * its shutdown thread when the server thread doesn't stop within a second).
+     */
+    private fun holdStartup(coordinator: MigrationCoordinator, fallback: OutageFallback) {
+        coordinator.registrationClosed(startupRun = true)
+        when (awaitStartup(coordinator.startup)) {
+            StartupOutcome.PLUGINS_FAILED -> {
+                logger.severe("Migrations failed for some plugins before any of their scripts ran (see the lines above); those " +
+                    "plugins stay inactive. Startup continues with CMI maintenance on: once the cause is fixed and the server " +
+                    "restarted, switch it off by hand (cmi maintenance false).")
+                fallback.activateNow()
+            }
+            StartupOutcome.STOPPED -> server.shutdown()
+            StartupOutcome.CLEAN, null -> {}
+        }
     }
 
     override fun onDisable() {
@@ -66,32 +80,14 @@ open class SneakyDB : JavaPlugin() {
 }
 
 /**
- * Refuses logins while [gate] is closed, three times. Pre-login at the lowest priority refuses early, so later handlers
- * can see the login is already refused. A later handler can still allow it again, and a player whose pre-login ran
- * before this listener existed never met it, so the validate-login event refuses again at the monitor priority: Paper
- * fires it when the login starts and again when configuration finishes. It changes the result at the monitor priority
- * on purpose, so no handler at a normal priority can override it. Paper can still replace that result afterwards: when
- * any plugin listens to the deprecated `PlayerLoginEvent`, a handler there that allows a login vanilla refused (full
- * server, whitelist) is saved and replaces the configuration-phase result. So a player who joins while the gate is
- * closed is kicked at the join itself. This listener never registers for `PlayerLoginEvent`: doing so would switch on
- * Paper's legacy login path on servers that don't otherwise use it.
+ * Runs [hold] at `ServerLoadEvent` with load type `STARTUP`. Paper fires it on the server thread once every plugin has
+ * enabled, right before it lets the server's network channels accept connections and before the first tick; a reload
+ * fires it with `RELOAD`, which starts nothing. Monitor priority, so registrations from other handlers of the same event
+ * are in the startup run.
  */
-internal class LoginGateListener(private val gate: LoginGate) : Listener {
-    @EventHandler(priority = EventPriority.LOWEST)
-    fun onPreLogin(event: AsyncPlayerPreLoginEvent) {
-        val refusal = gate.refusal() ?: return
-        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, Component.text(refusal))
-    }
-
+internal class StartupListener(private val hold: () -> Unit) : Listener {
     @EventHandler(priority = EventPriority.MONITOR)
-    fun onValidateLogin(event: PlayerConnectionValidateLoginEvent) {
-        val refusal = gate.refusal() ?: return
-        if (event.isAllowed) event.kickMessage(Component.text(refusal))
-    }
-
-    @EventHandler(priority = EventPriority.LOWEST)
-    fun onJoin(event: PlayerJoinEvent) {
-        val refusal = gate.refusal() ?: return
-        event.player.kick(Component.text(refusal))
+    fun onServerLoad(event: ServerLoadEvent) {
+        if (event.type == ServerLoadEvent.LoadType.STARTUP) hold()
     }
 }

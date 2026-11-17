@@ -106,7 +106,8 @@ internal fun planMigrations(
                     other in failures -> unresolved[key] = "${script.fileName} needs $requirement, but $other's migrations failed"
                     other in waiting -> unresolved[key] = "${script.fileName} needs $requirement, but the database has $other at " +
                         "version $otherVersion and $other registered after this plugin's migrations were planned, so its scripts " +
-                        "haven't run yet; restart the server so both are planned together"
+                        "haven't run yet; restart the server so both are planned together (if $other always registers after " +
+                        "startup, a restart doesn't help: it has to register during its enable)"
                     otherScripts != null -> unresolved[key] = "${script.fileName} needs $requirement, but the database has $other at " +
                         "version $otherVersion and its build on this server only has scripts up to ${otherScripts.size}; " +
                         "install the $other build that adds that script together with this one"

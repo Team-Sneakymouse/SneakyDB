@@ -50,8 +50,7 @@ class ProxyConfigTest {
         val fromProxy = ProxyConfig.migrations(directory, logged::add)
         assertEquals(fromPaper.mode, fromProxy.mode)
         assertEquals(fromPaper.lockTimeoutSeconds, fromProxy.lockTimeoutSeconds)
-        assertEquals(fromPaper.loginMessage, fromProxy.loginMessage)
-        assertEquals(com.sneakydb.MigrationSettings.DEFAULT_LOGIN_MESSAGE, fromProxy.loginMessage)
+        assertEquals(setOf("mode", "lock-timeout-seconds"), proxy.childrenMap().keys.map { it.toString() }.toSet())
         assertTrue(logged.isEmpty())
     }
 

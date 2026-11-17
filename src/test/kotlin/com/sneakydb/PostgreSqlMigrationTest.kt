@@ -61,7 +61,7 @@ class PostgreSqlMigrationTest {
     }
 
     private fun session(mode: MigrationMode = MigrationMode.APPLY, lockTimeout: Int = 10): MigrationCoordinator {
-        val session = startDatabaseSession(DatabaseConfig("postgresql", settings), MigrationSettings(mode, lockTimeout, "starting"), info::add, severe::add) {}
+        val session = startDatabaseSession(DatabaseConfig("postgresql", settings), MigrationSettings(mode, lockTimeout), info::add, severe::add) {}
         sessions.add(session)
         return session.migrations!!
     }
@@ -87,7 +87,7 @@ class PostgreSqlMigrationTest {
         val plots = coordinator.add("plots", *plotsScripts)
         coordinator.registrationClosed()
         assertEquals(2, plots.await())
-        assertTrue(coordinator.startup.get(30, TimeUnit.SECONDS))
+        assertEquals(StartupOutcome.CLEAN, coordinator.startup.get(30, TimeUnit.SECONDS))
         assertEquals(listOf("plots:1", "plots:2"), versions())
         assertEquals(listOf(2), rows("select count(*) from plots") { it.getInt(1) })
         val stored = rows("select name, checksum from sneakydb.schema_migrations order by version") { it.getString(1) to it.getString(2) }
@@ -122,12 +122,14 @@ class PostgreSqlMigrationTest {
         coordinator.registrationClosed()
         val message = failure(plots)
         assertTrue(message.startsWith("Migrations for plots failed at V002__broken.sql: SQL state 42P01: ERROR: relation \"missing_table\" does not exist"), message)
-        assertEquals(listOf(message), severe)
+        assertEquals(message, severe.first())
+        assertTrue(severe.last().startsWith("Migrations (startup, apply mode) stopped: plots:V002__broken.sql failed while running"), severe.last())
+        assertEquals(2, severe.size, severe.toString())
         assertEquals(listOf("plots:1"), versions())
         assertFalse(exists("plot_notes"), "the script's earlier statements were rolled back")
         assertEquals(listOf(0), rows("select count(*) from plots") { it.getInt(1) })
         assertFalse(exists("plot_later"), "later scripts were skipped")
-        assertFalse(coordinator.startup.get(30, TimeUnit.SECONDS))
+        assertEquals(StartupOutcome.STOPPED, coordinator.startup.get(30, TimeUnit.SECONDS))
     }
 
     @Test fun `session settings a script changes don't leak into the pool`() {
@@ -183,7 +185,7 @@ class PostgreSqlMigrationTest {
         assertEquals(1, other.await())
         assertEquals(listOf("alpha:1", "beta:1", "other:1"), versions().sorted())
         assertEquals("integer", columnType("alpha_owner", "id"), "alpha 2 did not run")
-        assertFalse(onlyAlpha.startup.get(30, TimeUnit.SECONDS))
+        assertEquals(StartupOutcome.PLUGINS_FAILED, onlyAlpha.startup.get(30, TimeUnit.SECONDS))
 
         val onlyBeta = session()
         val alphaOld = onlyBeta.add("alpha", alphaScripts[0])
@@ -210,7 +212,7 @@ class PostgreSqlMigrationTest {
         assertEquals(recorded.toSet().size, recorded.size, "no script recorded twice")
         assertEquals(listOf(2), rows("select count(*) from plots") { it.getInt(1) }, "seed inserted once")
         assertTrue(severe.isEmpty(), severe.toString())
-        assertTrue(listOf(left, right).all { it.startup.get(30, TimeUnit.SECONDS) })
+        assertTrue(listOf(left, right).all { it.startup.get(30, TimeUnit.SECONDS) == StartupOutcome.CLEAN })
     }
 
     @Test fun `an operator row with a null checksum counts as applied and gets the checksum in apply mode`() {
@@ -346,7 +348,7 @@ class PostgreSqlMigrationTest {
         older.registrationClosed()
         val message = failure(plots)
         assertTrue(message.contains("the database is newer than this build: it is at version 3, this build's scripts go up to 2"), message)
-        assertFalse(older.startup.get(30, TimeUnit.SECONDS))
+        assertEquals(StartupOutcome.PLUGINS_FAILED, older.startup.get(30, TimeUnit.SECONDS))
 
         sql("drop table plot_more, plots; delete from sneakydb.schema_migrations")
         val oldest = interleaved { otherServerApplies("plots", *plotsScripts) }
@@ -369,7 +371,7 @@ class PostgreSqlMigrationTest {
         val message = failure(plots)
         assertTrue(message.contains("V001__init.sql differs from the script that was applied (checksum mismatch)"), message)
         assertEquals(listOf("0".repeat(64)), rows("select checksum from sneakydb.schema_migrations") { it.getString(1) })
-        assertFalse(server.startup.get(30, TimeUnit.SECONDS))
+        assertEquals(StartupOutcome.PLUGINS_FAILED, server.startup.get(30, TimeUnit.SECONDS))
     }
 
     @Test fun `a plugin with nothing pending is ready only after its checksum fill-in succeeded`() {
@@ -387,7 +389,7 @@ class PostgreSqlMigrationTest {
             coordinator.registrationClosed()
             val message = failure(plots)
             assertTrue(message.contains("SQL state 42501"), message)
-            assertFalse(coordinator.startup.get(30, TimeUnit.SECONDS))
+            assertEquals(StartupOutcome.PLUGINS_FAILED, coordinator.startup.get(30, TimeUnit.SECONDS))
         } finally {
             sessions.forEach { it.close() }
             sessions.clear()
@@ -443,8 +445,39 @@ class PostgreSqlMigrationTest {
         coordinator.registrationClosed()
         val message = failure(plots)
         assertTrue(message.contains("standard_conforming_strings is off"), message)
+        assertTrue(message.contains("The usual cause is a setting on the database or the role"), message)
+        assertTrue(message.contains("alter database $database reset standard_conforming_strings; alter role ${admin!!.username} reset " +
+            "standard_conforming_strings;"), message)
         assertFalse(exists("plots"))
         assertEquals(emptyList<String>(), versions())
+        assertEquals(StartupOutcome.PLUGINS_FAILED, coordinator.startup.get(30, TimeUnit.SECONDS), "nothing of the script ran")
+    }
+
+    @Test fun `a script that loses its connection is reported as rolled back, not as possibly half applied`() {
+        val coordinator = session()
+        val plots = coordinator.unchecked("plots", "V001__init.sql", "create table plots_early (id int);\nselect pg_terminate_backend(pg_backend_pid());")
+        val other = coordinator.add("zother", "V001__other.sql" to "create table other_table (id int);")
+        coordinator.registrationClosed()
+        val message = failure(plots)
+        assertTrue(message.contains("the connection to the database was lost while it ran"), message)
+        assertTrue(message.contains("PostgreSQL rolls back a transaction that was not committed"), message)
+        assertFalse(message.contains("may hold part of its changes"), message)
+        assertFalse(exists("plots_early"), "PostgreSQL rolled the script back")
+        assertEquals(emptyList<String>(), versions())
+        assertTrue(failure(other).contains("not completed, because plots:V001__init.sql failed while running"))
+        assertEquals(StartupOutcome.STOPPED, coordinator.startup.get(30, TimeUnit.SECONDS), "a lost connection still stops the run")
+    }
+
+    @Test fun `a script can't roll back to SneakyDB's savepoint and be recorded as applied`() {
+        val coordinator = session()
+        val plots = coordinator.unchecked("plots", "V001__init.sql",
+            "create table plots_undone (id int);\nrollback to savepoint sneakydb_script;\ncreate table plots_kept (id int);")
+        coordinator.registrationClosed()
+        val message = failure(plots)
+        assertTrue(message.contains("SQL state 3B001"), message)
+        assertEquals(emptyList<String>(), versions())
+        assertFalse(exists("plots_undone"))
+        assertFalse(exists("plots_kept"))
     }
 
     @Test fun `a script that turns standard_conforming_strings off fails at its next statement`() {

@@ -1,14 +1,11 @@
 package com.sneakydb.velocity
 
 import com.google.inject.Inject
-import com.velocitypowered.api.event.ResultedEvent
 import com.velocitypowered.api.event.Subscribe
-import com.velocitypowered.api.event.connection.LoginEvent
-import com.velocitypowered.api.event.connection.PreLoginEvent
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent
 import com.velocitypowered.api.event.proxy.ProxyShutdownEvent
 import com.velocitypowered.api.plugin.annotation.DataDirectory
-import net.kyori.adventure.text.Component
+import com.velocitypowered.api.proxy.ProxyServer
 import org.slf4j.Logger
 import java.nio.file.Path
 
@@ -16,39 +13,24 @@ import java.nio.file.Path
  * Velocity entry point (velocity-plugin.json, id `sneakydb`). References no Bukkit classes.
  *
  * Initialization runs at the highest priority, so the provider is registered before any other plugin's
- * ProxyInitializeEvent handler at normal order or later. A second handler at the lowest priority closes migration
- * registration after the other plugins' handlers. Shutdown runs at the lowest priority, after consumers' own shutdown
- * handlers, like Paper disabling SneakyDB after its dependents.
+ * ProxyInitializeEvent handler at normal order or later. A second handler at the lowest priority runs the startup
+ * migrations after the other plugins' handlers and blocks until they end: Velocity binds its listener only after the
+ * event has completed. Shutdown runs at the lowest priority, after consumers' own shutdown handlers, like Paper
+ * disabling SneakyDB after its dependents.
  */
-class SneakyDBVelocity @Inject constructor(logger: Logger, @DataDirectory dataDirectory: Path) {
-    private val runtime = ProxyRuntime(dataDirectory, logger::info, logger::warn, logger::error)
+class SneakyDBVelocity private constructor(private val runtime: ProxyRuntime) {
+    @Inject constructor(proxy: ProxyServer, logger: Logger, @DataDirectory dataDirectory: Path) :
+        this(ProxyRuntime(dataDirectory, logger::info, logger::warn, logger::error, { proxy.shutdown() }))
+
+    /** For tests: [park] replaces waiting for the JVM to exit after asking the proxy to shut down. */
+    internal constructor(proxy: ProxyServer, logger: Logger, dataDirectory: Path, park: () -> Unit) :
+        this(ProxyRuntime(dataDirectory, logger::info, logger::warn, logger::error, { proxy.shutdown() }, park))
 
     @Subscribe(priority = Short.MAX_VALUE, async = false)
     fun onProxyInitialize(@Suppress("UNUSED_PARAMETER") event: ProxyInitializeEvent) = runtime.start()
 
     @Subscribe(priority = Short.MIN_VALUE, async = false)
     fun onProxyInitialized(@Suppress("UNUSED_PARAMETER") event: ProxyInitializeEvent) = runtime.initialized()
-
-    /** Refuses logins until the startup migration run has finished without a failure; runs first, so others see it. */
-    @Subscribe(priority = Short.MAX_VALUE)
-    fun onPreLogin(event: PreLoginEvent) {
-        val refusal = runtime.loginRefusal() ?: return
-        event.result = PreLoginEvent.PreLoginComponentResult.denied(Component.text(refusal))
-    }
-
-    /** Runs after every other pre-login handler: one that allowed the login again (`forceOnlineMode()`) doesn't win. */
-    @Subscribe(priority = Short.MIN_VALUE)
-    fun onPreLoginFinal(event: PreLoginEvent) {
-        val refusal = runtime.loginRefusal() ?: return
-        if (event.result.isAllowed) event.result = PreLoginEvent.PreLoginComponentResult.denied(Component.text(refusal))
-    }
-
-    /** The last point before the player joins: catches a login that passed pre-login before the gate closed or opened. */
-    @Subscribe(priority = Short.MIN_VALUE)
-    fun onLogin(event: LoginEvent) {
-        val refusal = runtime.loginRefusal() ?: return
-        if (event.result.isAllowed) event.result = ResultedEvent.ComponentResult.denied(Component.text(refusal))
-    }
 
     @Subscribe(priority = Short.MIN_VALUE, async = false)
     fun onProxyShutdown(@Suppress("UNUSED_PARAMETER") event: ProxyShutdownEvent) = runtime.stop()

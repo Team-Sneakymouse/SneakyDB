@@ -15,16 +15,29 @@ internal const val MIGRATIONS_DIRECTORY = "db/migrations"
 internal val PLUGIN_ID = Regex("[a-z][a-z0-9_]{0,62}")
 private val SCRIPT_NAME = Regex("V([0-9]+)__([A-Za-z0-9][A-Za-z0-9_-]*)\\.sql")
 /**
- * A comment line is a requires directive when its first word is `requires` or `requires-if-present`, or the near-miss
- * `require` or `require-if-present` (any case), followed by a colon, or followed by something shaped like `<id> >= <n>`
- * (a forgotten colon). Other comments are prose. Only the exact lower-case forms in [REQUIREMENT] parse.
+ * After the leading comment block, a comment line is a misplaced requires directive when its first word is `requires`
+ * or `requires-if-present`, or the near-miss `require` or `require-if-present` (any case), followed by a colon, or
+ * followed by something shaped like `<id> >= <n>` (a forgotten colon). Only the exact lower-case forms in
+ * [REQUIREMENT] parse.
  */
 private val REQUIREMENT_LINE = Regex(
     "--\\s*(requires?|requires?-if-present)(\\s*:.*|\\s+[A-Za-z_][A-Za-z0-9_]*\\s*(>=|=>|<=|>|<|=).*)", RegexOption.IGNORE_CASE)
+/** The colon form of the four directive words, any case: `-- Requires: …` is a directive that must parse. */
+private val DIRECTIVE_COLON = Regex("--\\s*(requires?|requires?-if-present)\\s*:.*", RegexOption.IGNORE_CASE)
+/** A comment whose first word starts with `requir`, any case, whatever follows up to whitespace or a colon. */
+private val REQUIR_WORD = Regex("--\\s*requir[^\\s:]*(\\s.*|:.*)?", RegexOption.IGNORE_CASE)
+/** `<id> <operator> <number>` anywhere in a line: the shape of a requirement, whatever words come before it. */
+private val COMPARISON = Regex("[A-Za-z_][A-Za-z0-9_]*\\s*(>=|=>|<=|=<|==|!=|>|<|=|≥|≤)\\s*[0-9]")
 private val REQUIREMENT = Regex("--\\s*(requires|requires-if-present):\\s*([a-z][a-z0-9_]{0,62})\\s*>=\\s*([0-9]{1,9})\\s*")
 
 /** A failure whose message tells the plugin author or operator what to do. Never carries credentials. */
-internal class MigrationException(message: String) : IllegalStateException(message)
+internal open class MigrationException(message: String) : IllegalStateException(message)
+
+/**
+ * A script failed once it had started running: its SQL failed, the lock timeout hit, the connection was lost, or it
+ * could not be confirmed that the script stayed in its transaction. A run stops at such a failure.
+ */
+internal class ScriptFailedException(message: String) : MigrationException(message)
 
 /** `-- requires: <plugin> >= <version>`, or `-- requires-if-present:` when [ifPresent]. */
 internal data class Requirement(val plugin: String, val version: Int, val ifPresent: Boolean) {
@@ -133,8 +146,8 @@ internal fun sha256(text: String): String =
 
 /**
  * Reads `-- requires` directives from the leading comment block (blank lines and `--` comments before the first SQL).
- * A directive-shaped line (see [REQUIREMENT_LINE]) that doesn't parse, or one after the first SQL line, is an error,
- * so a typo can't drop a dependency silently.
+ * A directive-shaped line that doesn't parse ([isHeaderDirective] in the block, [REQUIREMENT_LINE] after it) is an
+ * error, and so is a directive after the first SQL line, so a typo can't drop a dependency silently.
  */
 internal fun parseRequirements(plugin: String, fileName: String, version: Int, text: String): List<Requirement> {
     val requirements = LinkedHashMap<Pair<String, Boolean>, Requirement>()
@@ -142,7 +155,7 @@ internal fun parseRequirements(plugin: String, fileName: String, version: Int, t
     text.lineSequence().forEachIndexed { index, raw ->
         val line = raw.trim()
         if (inHeader && line.isNotEmpty() && !line.startsWith("--")) inHeader = false
-        if (!REQUIREMENT_LINE.matches(line)) return@forEachIndexed
+        if (!(if (inHeader) isHeaderDirective(line) else REQUIREMENT_LINE.matches(line))) return@forEachIndexed
         val where = "$plugin: $fileName line ${index + 1}"
         if (!inHeader) throw MigrationException("$where: requires lines belong in the comment block before the first SQL statement")
         val match = REQUIREMENT.matchEntire(line) ?: throw MigrationException(
@@ -159,6 +172,15 @@ internal fun parseRequirements(plugin: String, fileName: String, version: Int, t
     return requirements.values.toList()
 }
 
+/**
+ * In the leading comment block, a comment line is a directive that must parse when its first word starts with
+ * `requir` (any case, any punctuation after it: `requires_if_present`, `required`, `requirement`, non-breaking
+ * hyphens) and the line holds a comparison shaped like `<id> >= <n>`, or when it is the colon form of a directive word
+ * ([DIRECTIVE_COLON]). Prose such as `-- requires the index above` or `-- Requirements: none` stays a comment.
+ */
+private fun isHeaderDirective(line: String): Boolean =
+    DIRECTIVE_COLON.matches(line) || (REQUIR_WORD.matches(line) && COMPARISON.containsMatchIn(line))
+
 private val TRANSACTION_CONTROL = setOf("begin", "commit", "end", "rollback", "abort", "savepoint", "release")
 private val ROUTINE = setOf("function", "procedure")
 private val DOLLAR_TAG = Regex("\\$([A-Za-z_\\u0080-\\uffff][A-Za-z0-9_\\u0080-\\uffff]*)?\\$")
@@ -166,11 +188,12 @@ private val DOLLAR_TAG = Regex("\\$([A-Za-z_\\u0080-\\uffff][A-Za-z0-9_\\u0080-\
 /**
  * The first top-level statement of [sql] that controls the transaction (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`,
  * `ROLLBACK`, `ABORT`, `SAVEPOINT`, `RELEASE`, `PREPARE TRANSACTION`, `COMMIT PREPARED`, `ROLLBACK PREPARED`), as its
- * line and leading words, or null. Reads [sql] as PostgreSQL's lexer does with `standard_conforming_strings` on (the
- * store refuses to run scripts otherwise): `--` and nested `/* */` comments, `'…'` and `E'…'` strings, `"…"`
- * identifiers, dollar-quoted bodies, and identifiers in which every character at or above U+0080 counts as a letter,
- * so `€$q$` is one identifier and not the start of a dollar quote. `BEGIN … END` inside a function body or `DO` block
- * is therefore not a statement.
+ * line and leading words, or null. A courtesy check for the common mistake of wrapping a script in `BEGIN; … COMMIT;`:
+ * the store's check after each script is what keeps a script that ended its transaction from being recorded. It reads
+ * [sql] with `standard_conforming_strings` on (the store refuses to run scripts otherwise): `--` and nested `/* */`
+ * comments, `'…'` and `E'…'` strings, `"…"` identifiers, dollar-quoted bodies, and identifiers in which every
+ * character at or above U+0080 counts as a letter, so `€$q$` is one identifier and not the start of a dollar quote.
+ * `BEGIN … END` inside a function body or `DO` block is therefore not a statement.
  *
  * A `CREATE [OR REPLACE] FUNCTION|PROCEDURE` statement with a SQL-standard body keeps its semicolons from `BEGIN ATOMIC`
  * (the two words with nothing but whitespace or comments between them) to the body's `END`. As in PostgreSQL's grammar,

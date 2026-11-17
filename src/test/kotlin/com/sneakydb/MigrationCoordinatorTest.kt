@@ -22,13 +22,14 @@ class MigrationCoordinatorTest {
     }
 
     /**
-     * The version table in memory, with the same under-lock re-checks as the PostgreSQL store; [failing] scripts throw a
-     * PostgreSQL-style error instead of applying.
+     * The version table in memory, with the same under-lock re-checks as the PostgreSQL store; [failing] scripts fail
+     * while running with a PostgreSQL-style error, [rejected] ones fail under the lock before they start.
      */
     internal class FakeStore : MigrationStore {
         val rows = sortedMapOf<String, MutableMap<Int, String?>>()
         val log = mutableListOf<String>()
         val failing = mutableSetOf<String>()
+        val rejected = mutableSetOf<String>()
         var readFailure: Throwable? = null
         var fillFailure: Throwable? = null
         val modes = mutableListOf<MigrationMode>()
@@ -55,8 +56,9 @@ class MigrationCoordinatorTest {
 
         override fun apply(step: PlannedStep, lockTimeoutSeconds: Int): Boolean {
             val name = step.toString()
-            if (name in failing) throw SQLException("ERROR: relation \"missing\" does not exist\n  Position: 15", "42P01")
             if (!recheckStep(step, snapshot())) return false
+            if (name in rejected) throw MigrationException("expected ${step.plugin} at version 0 before this script, but the database has version 1; restart the server")
+            if (name in failing) throw ScriptFailedException(describeFailure(SQLException("ERROR: relation \"missing\" does not exist\n  Position: 15", "42P01")))
             rows.getOrPut(step.plugin) { mutableMapOf() }[step.script.version] = step.script.checksum
             log.add(name)
             return true
@@ -74,7 +76,7 @@ class MigrationCoordinatorTest {
     private val ready = CompletableFuture<Void>()
 
     private fun coordinator(mode: MigrationMode = MigrationMode.APPLY) =
-        MigrationCoordinator(MigrationSettings(mode, 10, "starting"), store, { ready }, info::add, severe::add, Inline())
+        MigrationCoordinator(MigrationSettings(mode, 10), store, { ready }, info::add, severe::add, Inline())
 
     private fun MigrationCoordinator.register(plugin: String, vararg bodies: String): CompletableFuture<Int> =
         register(plugin) { scripts(plugin, *bodies.mapIndexed { i, body -> "V${i + 1}__s${i + 1}.sql" to "$body\nselect 1;" }.toTypedArray()) }
@@ -93,7 +95,7 @@ class MigrationCoordinatorTest {
         assertEquals(listOf("alpha:V1__s1.sql", "beta:V1__s1.sql", "alpha:V2__s2.sql", "beta:V2__s2.sql", "ready beta", "alpha:V3__s3.sql", "ready alpha"), store.log)
         assertEquals(3, alpha.join())
         assertEquals(2, beta.join())
-        assertTrue(coordinator.startup.join())
+        assertEquals(StartupOutcome.CLEAN, coordinator.startup.join())
         assertEquals(6, info.size, "one line per script and a summary")
         assertTrue(info[0].startsWith("Applied migration alpha:V1__s1.sql in "))
         assertTrue(info.last().startsWith("Migrations (startup, apply mode): 5 scripts applied, 2 of 2 plugins ready in "), info.last())
@@ -118,25 +120,110 @@ class MigrationCoordinatorTest {
     @Test fun `no registrations opens the startup result as soon as registration closes, even before readiness`() {
         val coordinator = coordinator()
         coordinator.registrationClosed()
-        assertTrue(coordinator.startup.join())
+        assertEquals(StartupOutcome.CLEAN, coordinator.startup.join())
         assertTrue(store.modes.isEmpty())
     }
 
-    @Test fun `a failing script fails its plugin and everything that depends on it, others still migrate`() {
+    @Test fun `a script that fails while running stops the run and fails every plugin not completed yet`() {
         ready.complete(null)
+        store.rows["done"] = mutableMapOf(1 to null)
         store.failing.add("alpha:V2__s2.sql")
+        val coordinator = coordinator()
+        val done = coordinator.register("done", "") // nothing pending: completes before any script runs
+        val alpha = coordinator.register("alpha", "", "", "")
+        val beta = coordinator.register("beta", "-- requires: alpha >= 2")
+        val gamma = coordinator.register("gamma", "", "")
+        coordinator.registrationClosed()
+        assertEquals(listOf("fill done [1]", "ready done", "alpha:V1__s1.sql"), store.log, "gamma's independent scripts don't run either")
+        assertEquals(1, done.join(), "a plugin completed before the failure stays completed")
+        assertEquals("Migrations for alpha failed at V2__s2.sql: SQL state 42P01: ERROR: relation \"missing\" does not exist; Position: 15", failureOf(alpha))
+        for ((plugin, future) in listOf("beta" to beta, "gamma" to gamma)) {
+            assertEquals("Migrations for $plugin failed: not completed, because alpha:V2__s2.sql failed while running and SneakyDB ran no further script",
+                failureOf(future))
+        }
+        assertEquals(StartupOutcome.STOPPED, coordinator.startup.join())
+        assertEquals(2, severe.size, "the failed script's line and one summary: $severe")
+        assertTrue(severe[1].startsWith("Migrations (startup, apply mode) stopped: alpha:V2__s2.sql failed while running, so no further " +
+            "script ran; 1 scripts applied, 1 of 4 plugins ready; failed: alpha, beta, gamma. The server stops"), severe[1])
+        assertTrue(info.none { it.startsWith("Migrations (") }, "the summary is the severe line")
+    }
+
+    @Test fun `a script rejected under the lock before it started fails only its plugin and its dependents`() {
+        ready.complete(null)
+        store.rejected.add("alpha:V2__s2.sql")
         val coordinator = coordinator()
         val alpha = coordinator.register("alpha", "", "", "")
         val beta = coordinator.register("beta", "-- requires: alpha >= 2")
         val gamma = coordinator.register("gamma", "", "")
         coordinator.registrationClosed()
         assertEquals(listOf("alpha:V1__s1.sql", "gamma:V1__s1.sql", "gamma:V2__s2.sql", "ready gamma"), store.log)
-        assertEquals("Migrations for alpha failed at V2__s2.sql: SQL state 42P01: ERROR: relation \"missing\" does not exist; Position: 15", failureOf(alpha))
+        assertTrue(failureOf(alpha).endsWith("restart the server"))
         assertEquals("Migrations for beta failed at V1__s1.sql: not run because it requires alpha:V2__s2.sql, which failed", failureOf(beta))
         assertEquals(2, gamma.join())
-        assertFalse(coordinator.startup.join())
+        assertEquals(StartupOutcome.PLUGINS_FAILED, coordinator.startup.join())
         assertEquals(2, severe.size, "one severe line per failed plugin")
         assertTrue(info.last().contains("1 of 3 plugins ready; failed: alpha, beta"), info.last())
+    }
+
+    @Test fun `a script failing while running wins over failures caught before the run`() {
+        ready.complete(null)
+        store.failing.add("gamma:V1__s1.sql")
+        val coordinator = coordinator()
+        val alpha = coordinator.register("alpha", "-- requires: beta >= 1")
+        val beta = coordinator.register("beta", "-- requires: alpha >= 1")
+        val gamma = coordinator.register("gamma", "")
+        coordinator.registrationClosed()
+        assertTrue(failureOf(alpha).contains("form a cycle"))
+        assertTrue(failureOf(beta).contains("form a cycle"))
+        assertTrue(failureOf(gamma).contains("SQL state 42P01"))
+        assertEquals(StartupOutcome.STOPPED, coordinator.startup.join())
+    }
+
+    @Test fun `a late batch stops at a script that fails while running, without touching the startup outcome`() {
+        ready.complete(null)
+        val executor = Queued()
+        val coordinator = MigrationCoordinator(MigrationSettings(MigrationMode.APPLY, 10), store, { ready }, info::add, severe::add, executor)
+        coordinator.registrationClosed()
+        executor.runAll()
+        assertEquals(StartupOutcome.CLEAN, coordinator.startup.join())
+        store.failing.add("la:V1__s1.sql")
+        val la = coordinator.register("la", "")
+        val lb = coordinator.register("lb", "")
+        executor.runAll()
+        assertTrue(failureOf(la).contains("SQL state 42P01"))
+        assertTrue(failureOf(lb).contains("not completed, because la:V1__s1.sql failed while running"))
+        assertTrue(store.log.isEmpty(), store.log.toString())
+        assertTrue(severe.last().startsWith("Migrations (late registration of la, lb, apply mode) stopped: la:V1__s1.sql failed while running"), severe.last())
+        assertFalse(severe.last().contains("server stops"), severe.last())
+        assertEquals(StartupOutcome.CLEAN, coordinator.startup.join())
+    }
+
+    @Test fun `closing registration outside startup runs what registered as a late batch and reports a clean startup`() {
+        ready.complete(null)
+        store.failing.add("alpha:V1__s1.sql")
+        val coordinator = coordinator()
+        val alpha = coordinator.register("alpha", "")
+        coordinator.registrationClosed(startupRun = false)
+        assertEquals(StartupOutcome.CLEAN, coordinator.startup.join())
+        assertTrue(failureOf(alpha).contains("SQL state 42P01"))
+        assertTrue(severe.last().startsWith("Migrations (late registration of alpha, apply mode) stopped"), severe.last())
+        coordinator.registrationClosed(startupRun = true)
+        assertEquals(StartupOutcome.CLEAN, coordinator.startup.join(), "only the first close counts")
+    }
+
+    @Test fun `awaiting the startup run returns its outcome, or null once SneakyDB shut down`() {
+        val coordinator = MigrationCoordinator(MigrationSettings.DEFAULTS, store, { ready }, info::add, severe::add)
+        coordinator.register("alpha", "")
+        coordinator.registrationClosed()
+        val waited = CompletableFuture.supplyAsync { awaitStartup(coordinator.startup) }
+        Thread.sleep(100)
+        assertFalse(waited.isDone, "readiness is pending: the run hasn't ended")
+        coordinator.close()
+        assertNull(waited.get(5, TimeUnit.SECONDS))
+        ready.completeExceptionally(IllegalStateException("SneakyDB has shut down")) // frees the migration thread
+        val clean = coordinator()
+        clean.registrationClosed()
+        assertEquals(StartupOutcome.CLEAN, awaitStartup(clean.startup))
     }
 
     @Test fun `plan failures fail only their own group before anything runs`() {
@@ -172,7 +259,7 @@ class MigrationCoordinatorTest {
         coordinator.registrationClosed()
         assertEquals("Migrations for alpha failed: $message", failureOf(alpha))
         assertEquals("Migrations for beta failed: $message", failureOf(beta))
-        assertFalse(coordinator.startup.join())
+        assertEquals(StartupOutcome.PLUGINS_FAILED, coordinator.startup.join())
         assertTrue(store.modes.isEmpty())
     }
 
@@ -183,7 +270,7 @@ class MigrationCoordinatorTest {
         val alpha = coordinator.register("alpha", "")
         coordinator.registrationClosed()
         assertTrue(failureOf(alpha).startsWith("Migrations for alpha failed: the schema sneakydb does not exist"))
-        assertFalse(coordinator.startup.join())
+        assertEquals(StartupOutcome.PLUGINS_FAILED, coordinator.startup.join())
     }
 
     @Test fun `connection failures don't repeat driver messages`() {
@@ -199,7 +286,7 @@ class MigrationCoordinatorTest {
         ready.complete(null)
         val coordinator = coordinator()
         coordinator.registrationClosed()
-        assertTrue(coordinator.startup.join())
+        assertEquals(StartupOutcome.CLEAN, coordinator.startup.join())
         val late = coordinator.register("late", "", "")
         assertEquals(2, late.join())
         assertEquals(listOf("late:V1__s1.sql", "late:V2__s2.sql", "ready late"), store.log)
@@ -208,7 +295,7 @@ class MigrationCoordinatorTest {
         store.failing.add("failing:V1__s1.sql")
         val failing = coordinator.register("failing", "")
         assertTrue(failureOf(failing).startsWith("Migrations for failing failed at V1__s1.sql"))
-        assertTrue(coordinator.startup.join())
+        assertEquals(StartupOutcome.CLEAN, coordinator.startup.join())
     }
 
     /** Queues batches until [runAll], like the migration thread while it is busy with an earlier batch. */
@@ -226,7 +313,7 @@ class MigrationCoordinatorTest {
     @Test fun `late registrations queued at the same time are planned together as one batch`() {
         ready.complete(null)
         val executor = Queued()
-        val coordinator = MigrationCoordinator(MigrationSettings(MigrationMode.APPLY, 10, "starting"), store, { ready }, info::add, severe::add, executor)
+        val coordinator = MigrationCoordinator(MigrationSettings(MigrationMode.APPLY, 10), store, { ready }, info::add, severe::add, executor)
         coordinator.registrationClosed()
         val lp = coordinator.register("lp", "-- requires-if-present: lq >= 1")
         val lq = coordinator.register("lq", "")
@@ -241,7 +328,7 @@ class MigrationCoordinatorTest {
     @Test fun `a plugin that registers while a late batch is planned is not taken as having its final version`() {
         ready.complete(null)
         val executor = Queued()
-        val coordinator = MigrationCoordinator(MigrationSettings(MigrationMode.APPLY, 10, "starting"), store, { ready }, info::add, severe::add, executor)
+        val coordinator = MigrationCoordinator(MigrationSettings(MigrationMode.APPLY, 10), store, { ready }, info::add, severe::add, executor)
         coordinator.registrationClosed()
         var lq: CompletableFuture<Int>? = null
         store.duringRead = { lq = coordinator.register("lq", "") }
@@ -308,7 +395,7 @@ class MigrationCoordinatorTest {
         val alpha = coordinator.register("alpha", "")
         coordinator.registrationClosed()
         assertEquals("Migrations for alpha failed: SQL state 42501: ERROR: permission denied for table schema_migrations", failureOf(alpha))
-        assertFalse(coordinator.startup.join())
+        assertEquals(StartupOutcome.PLUGINS_FAILED, coordinator.startup.join())
         assertTrue(store.log.isEmpty(), "never declared ready")
     }
 
@@ -325,7 +412,7 @@ class MigrationCoordinatorTest {
         val alpha = coordinator.register("alpha", "")
         coordinator.registrationClosed()
         assertTrue(failureOf(alpha).contains("the database is newer than this build: it is at version 2, this build's scripts go up to 1"))
-        assertFalse(coordinator.startup.join())
+        assertEquals(StartupOutcome.PLUGINS_FAILED, coordinator.startup.join())
     }
 
     @Test fun `a script another server applied meanwhile is skipped and counted`() {
@@ -359,7 +446,6 @@ class MigrationCoordinatorTest {
         val defaults = read()
         assertEquals(MigrationMode.APPLY, defaults.mode)
         assertEquals(10, defaults.lockTimeoutSeconds)
-        assertEquals(MigrationSettings.DEFAULT_LOGIN_MESSAGE, defaults.loginMessage)
         assertEquals(MigrationMode.VERIFY, read("mode" to " Verify ").mode)
         assertTrue(warnings.isEmpty())
         assertEquals(MigrationMode.VERIFY, read("mode" to "aply").mode, "a typo never writes")
@@ -367,8 +453,8 @@ class MigrationCoordinatorTest {
         assertEquals(1, read("lock-timeout-seconds" to 0).lockTimeoutSeconds)
         assertEquals(300, read("lock-timeout-seconds" to 9999).lockTimeoutSeconds)
         assertEquals(10, read("lock-timeout-seconds" to "5").lockTimeoutSeconds)
-        assertEquals("Back soon", read("login-message" to "Back soon").loginMessage)
-        assertEquals(MigrationSettings.DEFAULT_LOGIN_MESSAGE, read("login-message" to "two\nlines").loginMessage)
-        assertEquals(MigrationSettings.DEFAULT_LOGIN_MESSAGE, read("login-message" to " ").loginMessage)
+        val old = read("login-message" to "Back soon", "mode" to "verify")
+        assertEquals(MigrationMode.VERIFY, old.mode, "a config from before still reads; its login-message is ignored")
+        assertEquals(1, warnings.size)
     }
 }

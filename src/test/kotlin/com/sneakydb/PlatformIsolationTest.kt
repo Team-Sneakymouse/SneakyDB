@@ -17,7 +17,7 @@ class PlatformIsolationTest {
         "DatabaseStartupKt", "DatabaseSession", "NotificationWorker", "SneakyDBProvider", "SneakyDBRegistry",
         "adapter.PostgreSqlAdapter", "adapter.DatabaseAdapterKt",
         "SneakyDBTransaction", "TransactionsKt", "TransactionScope", "TransactionHandle",
-        "MigrationCoordinator", "MigrationSettings", "LoginGate", "MigrationCoordinatorKt", "MigrationPlanKt",
+        "MigrationCoordinator", "MigrationSettings", "StartupOutcome", "MigrationCoordinatorKt", "MigrationPlanKt",
         "MigrationScriptsKt", "TransactionControlScanner", "PostgreSqlMigrationStore",
     )
 

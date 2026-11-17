@@ -167,6 +167,22 @@ class MigrationScriptsTest {
         assertTrue(self.contains("can't require its own plugin at version 2 or later"), self)
     }
 
+    @Test fun `misspelled requires words with a comparison are directives that must parse`() {
+        val misspelled = listOf(
+            "-- requires_if_present: core >= 1", "-- requires if present: core >= 1", "-- required: core >= 1",
+            "-- requirement: core >= 1", "-- requires-if-exists: core >= 1", "-- requires‑if‑present: core >= 1",
+            "-- Required core > 1", "--REQUIREMENTS: core = 2",
+        )
+        for (line in misspelled) {
+            val message = failure("plots", "V1__a.sql" to "-- Moves plots.\n$line\nselect 1;")
+            assertTrue(message.startsWith("plots: V1__a.sql line 2: can't read"), "$line → $message")
+        }
+        // Without a comparison they stay prose, in the block and after it.
+        val prose = scripts("plots", "V1__a.sql" to "-- Requirements: none\n-- requires the index above\n-- required reading: the README\n" +
+            "select 1;\n-- required: core >= 1 is checked elsewhere\n").single()
+        assertEquals(emptyList<Requirement>(), prose.requirements)
+    }
+
     @Test fun `scripts that control the transaction at the top level fail the plugin`() {
         val cases = listOf(
             "begin;\ncreate table a (id int);\ncommit;" to "line 1: BEGIN",

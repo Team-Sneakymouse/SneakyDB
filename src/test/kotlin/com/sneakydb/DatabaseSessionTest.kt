@@ -422,6 +422,20 @@ class DatabaseSessionTest {
         assertInstanceOf(UnsupportedOperationException::class.java, unsupported.cause)
     }
 
+    @Test fun `shutdown while the startup run waits for readiness reports the shutdown, not failed plugins`() {
+        val session = DatabaseSession(Worker(), null, { s ->
+            // The real migration thread: it blocks on readiness, which this session's queued worker never settles.
+            MigrationCoordinator(MigrationSettings.DEFAULTS, MigrationCoordinatorTest.FakeStore(), s::whenReady, {}, {})
+        }) { Pool() }
+        val plots = session.migrate("plots", DatabaseSessionTest::class.java)
+        val coordinator = session.migrations!!
+        coordinator.registrationClosed()
+        Thread.sleep(50)
+        session.close()
+        assertNull(awaitStartup(coordinator.startup), "the platform's wait ends as for a shutdown")
+        assertEquals("SneakyDB has shut down", assertThrows(java.util.concurrent.CompletionException::class.java) { plots.join() }.cause?.message)
+    }
+
     @Test fun `the API's default migrate is unsupported for existing implementations`() {
         val double = object : SneakyDBApi {
             override fun query(sql: String, parameters: List<*>) = TODO()
