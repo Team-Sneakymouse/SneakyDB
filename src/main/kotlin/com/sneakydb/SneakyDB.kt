@@ -1,5 +1,6 @@
 package com.sneakydb
 
+import io.papermc.paper.event.connection.PlayerConnectionValidateLoginEvent
 import net.kyori.adventure.text.Component
 import org.bukkit.event.EventHandler
 import org.bukkit.event.EventPriority
@@ -63,11 +64,23 @@ open class SneakyDB : JavaPlugin() {
     }
 }
 
-/** Refuses logins while [gate] is closed. Lowest priority, so later handlers can see the login is already refused. */
+/**
+ * Refuses logins while [gate] is closed, twice. Pre-login at the lowest priority refuses early, so later handlers can
+ * see the login is already refused. A later handler can still allow it again, and a player whose pre-login ran before
+ * this listener existed never met it, so the validate-login event refuses again at the monitor priority: Paper fires
+ * it when the login starts and again when configuration finishes, the last point before the player joins the world.
+ * It changes the result at the monitor priority on purpose, so no handler at a normal priority can override it.
+ */
 internal class LoginGateListener(private val gate: LoginGate) : Listener {
     @EventHandler(priority = EventPriority.LOWEST)
     fun onPreLogin(event: AsyncPlayerPreLoginEvent) {
         val refusal = gate.refusal() ?: return
         event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, Component.text(refusal))
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    fun onValidateLogin(event: PlayerConnectionValidateLoginEvent) {
+        val refusal = gate.refusal() ?: return
+        if (event.isAllowed) event.kickMessage(Component.text(refusal))
     }
 }

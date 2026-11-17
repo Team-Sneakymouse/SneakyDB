@@ -1,7 +1,9 @@
 package com.sneakydb.velocity
 
 import com.google.inject.Inject
+import com.velocitypowered.api.event.ResultedEvent
 import com.velocitypowered.api.event.Subscribe
+import com.velocitypowered.api.event.connection.LoginEvent
 import com.velocitypowered.api.event.connection.PreLoginEvent
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent
 import com.velocitypowered.api.event.proxy.ProxyShutdownEvent
@@ -32,6 +34,20 @@ class SneakyDBVelocity @Inject constructor(logger: Logger, @DataDirectory dataDi
     fun onPreLogin(event: PreLoginEvent) {
         val refusal = runtime.loginRefusal() ?: return
         event.result = PreLoginEvent.PreLoginComponentResult.denied(Component.text(refusal))
+    }
+
+    /** Runs after every other pre-login handler: one that allowed the login again (`forceOnlineMode()`) doesn't win. */
+    @Subscribe(priority = Short.MIN_VALUE)
+    fun onPreLoginFinal(event: PreLoginEvent) {
+        val refusal = runtime.loginRefusal() ?: return
+        if (event.result.isAllowed) event.result = PreLoginEvent.PreLoginComponentResult.denied(Component.text(refusal))
+    }
+
+    /** The last point before the player joins: catches a login that passed pre-login before the gate closed or opened. */
+    @Subscribe(priority = Short.MIN_VALUE)
+    fun onLogin(event: LoginEvent) {
+        val refusal = runtime.loginRefusal() ?: return
+        if (event.result.isAllowed) event.result = ResultedEvent.ComponentResult.denied(Component.text(refusal))
     }
 
     @Subscribe(priority = Short.MIN_VALUE, async = false)

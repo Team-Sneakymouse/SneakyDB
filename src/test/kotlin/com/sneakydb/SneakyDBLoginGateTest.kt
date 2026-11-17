@@ -81,6 +81,34 @@ class SneakyDBLoginGateTest {
             "outage and migration failure share one CMI command")
     }
 
+    /** Calls Paper's validate-login event, the last check before the player joins; returns the refusal message or null. */
+    private fun validateLogin(): String? {
+        val connection = java.lang.reflect.Proxy.newProxyInstance(javaClass.classLoader,
+            arrayOf(io.papermc.paper.connection.PlayerConnection::class.java)) { _, method, _ -> error(method.name) }
+            as io.papermc.paper.connection.PlayerConnection
+        val event = io.papermc.paper.event.connection.PlayerConnectionValidateLoginEvent(connection, null)
+        server.pluginManager.callEvent(event)
+        return event.kickMessage?.let { net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText().serialize(it) }
+    }
+
+    /** A consumer that allows every login again at later priorities. */
+    class AllowingListener : org.bukkit.event.Listener {
+        @org.bukkit.event.EventHandler(priority = org.bukkit.event.EventPriority.HIGH)
+        fun onPreLogin(event: AsyncPlayerPreLoginEvent) = event.allow()
+
+        @org.bukkit.event.EventHandler(priority = org.bukkit.event.EventPriority.HIGHEST)
+        fun onValidateLogin(event: io.papermc.paper.event.connection.PlayerConnectionValidateLoginEvent) = event.allow()
+    }
+
+    @Test fun `a later handler that allows the login, or a pre-login that ran early, still can't join while migrations run`() {
+        load("migrations.login-message" to "Starting up")
+        server.pluginManager.registerEvents(AllowingListener(), MockBukkit.createMockPlugin("Consumer"))
+        assertNull(preLogin(), "the consumer's later pre-login handler allowed the login again")
+        assertEquals("Starting up", validateLogin(), "the final check refuses it before the player joins the world")
+        tickUntil { validateLogin() == null }
+        assertNull(validateLogin(), "open once the startup run finished")
+    }
+
     @Test fun `the listener refuses with the configured message and lets logins through once open`() {
         val gate = LoginGate("Closed for now")
         val listener = LoginGateListener(gate)

@@ -127,4 +127,55 @@ class ProxyLoginGateTest {
             assertTrue(login().isAllowed)
         } finally { plugin.onProxyShutdown(com.velocitypowered.api.event.proxy.ProxyShutdownEvent()) }
     }
+
+    private fun <T> stub(type: Class<T>): T =
+        type.cast(java.lang.reflect.Proxy.newProxyInstance(javaClass.classLoader, arrayOf(type)) { _, method, _ -> error(method.name) })
+
+    /** Runs [plugin]'s @Subscribe handlers for [event] together with [others] in Velocity's order: higher priority first. */
+    private fun dispatch(plugin: SneakyDBVelocity, event: Any, vararg others: Pair<Short, (Any) -> Unit>) {
+        val own = plugin.javaClass.methods.filter { it.parameterTypes.singleOrNull() == event.javaClass }.mapNotNull { method ->
+            method.getAnnotation(com.velocitypowered.api.event.Subscribe::class.java)?.let { subscribe ->
+                subscribe.priority to { e: Any -> method.invoke(plugin, e); Unit }
+            }
+        }
+        (own + others).sortedByDescending { it.first }.forEach { it.second(event) }
+    }
+
+    @Test fun `a later pre-login handler or a login that passed pre-login early can't get in while the gate is closed`(@TempDir directory: Path) {
+        unreachable(directory, "migrations:\n  login-message: Proxy starting\n")
+        val plugin = SneakyDBVelocity(org.slf4j.helpers.NOPLogger.NOP_LOGGER, directory)
+        plugin.onProxyInitialize(com.velocitypowered.api.event.proxy.ProxyInitializeEvent())
+        try {
+            val preLogin = com.velocitypowered.api.event.connection.PreLoginEvent(stub(com.velocitypowered.api.proxy.InboundConnection::class.java), "player")
+            val forceOnline: (Any) -> Unit = {
+                (it as com.velocitypowered.api.event.connection.PreLoginEvent).result =
+                    com.velocitypowered.api.event.connection.PreLoginEvent.PreLoginComponentResult.forceOnlineMode()
+            }
+            dispatch(plugin, preLogin, 0.toShort() to forceOnline)
+            assertFalse(preLogin.result.isAllowed, "a consumer at normal order set forceOnlineMode() after SneakyDB's early refusal")
+            assertEquals(net.kyori.adventure.text.Component.text("Proxy starting"), preLogin.result.reasonComponent.get())
+
+            val player = stub(com.velocitypowered.api.proxy.Player::class.java)
+            val login = com.velocitypowered.api.event.connection.LoginEvent(player)
+            dispatch(plugin, login)
+            assertFalse(login.result.isAllowed, "a player whose pre-login passed is refused at login while the gate is closed")
+
+            plugin.onProxyInitialized(com.velocitypowered.api.event.proxy.ProxyInitializeEvent())
+            awaitOpen(plugin)
+            val later = com.velocitypowered.api.event.connection.LoginEvent(player)
+            dispatch(plugin, later)
+            assertTrue(later.result.isAllowed)
+        } finally { plugin.onProxyShutdown(com.velocitypowered.api.event.proxy.ProxyShutdownEvent()) }
+    }
+
+    private fun awaitOpen(plugin: SneakyDBVelocity) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        val connection = stub(com.velocitypowered.api.proxy.InboundConnection::class.java)
+        while (System.nanoTime() < deadline) {
+            val event = com.velocitypowered.api.event.connection.PreLoginEvent(connection, "player")
+            dispatch(plugin, event)
+            if (event.result.isAllowed) return
+            Thread.sleep(5)
+        }
+    }
 }
