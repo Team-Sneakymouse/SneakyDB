@@ -6,6 +6,7 @@ import org.bukkit.event.EventHandler
 import org.bukkit.event.EventPriority
 import org.bukkit.event.Listener
 import org.bukkit.event.player.AsyncPlayerPreLoginEvent
+import org.bukkit.event.player.PlayerJoinEvent
 import org.bukkit.plugin.java.JavaPlugin
 
 /** Paper entry point (paper-plugin.yml). The Velocity entry point is com.sneakydb.velocity.SneakyDBVelocity. */
@@ -65,11 +66,15 @@ open class SneakyDB : JavaPlugin() {
 }
 
 /**
- * Refuses logins while [gate] is closed, twice. Pre-login at the lowest priority refuses early, so later handlers can
- * see the login is already refused. A later handler can still allow it again, and a player whose pre-login ran before
- * this listener existed never met it, so the validate-login event refuses again at the monitor priority: Paper fires
- * it when the login starts and again when configuration finishes, the last point before the player joins the world.
- * It changes the result at the monitor priority on purpose, so no handler at a normal priority can override it.
+ * Refuses logins while [gate] is closed, three times. Pre-login at the lowest priority refuses early, so later handlers
+ * can see the login is already refused. A later handler can still allow it again, and a player whose pre-login ran
+ * before this listener existed never met it, so the validate-login event refuses again at the monitor priority: Paper
+ * fires it when the login starts and again when configuration finishes. It changes the result at the monitor priority
+ * on purpose, so no handler at a normal priority can override it. Paper can still replace that result afterwards: when
+ * any plugin listens to the deprecated `PlayerLoginEvent`, a handler there that allows a login vanilla refused (full
+ * server, whitelist) is saved and replaces the configuration-phase result. So a player who joins while the gate is
+ * closed is kicked at the join itself. This listener never registers for `PlayerLoginEvent`: doing so would switch on
+ * Paper's legacy login path on servers that don't otherwise use it.
  */
 internal class LoginGateListener(private val gate: LoginGate) : Listener {
     @EventHandler(priority = EventPriority.LOWEST)
@@ -82,5 +87,11 @@ internal class LoginGateListener(private val gate: LoginGate) : Listener {
     fun onValidateLogin(event: PlayerConnectionValidateLoginEvent) {
         val refusal = gate.refusal() ?: return
         if (event.isAllowed) event.kickMessage(Component.text(refusal))
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST)
+    fun onJoin(event: PlayerJoinEvent) {
+        val refusal = gate.refusal() ?: return
+        event.player.kick(Component.text(refusal))
     }
 }

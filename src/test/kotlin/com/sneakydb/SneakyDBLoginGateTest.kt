@@ -109,6 +109,34 @@ class SneakyDBLoginGateTest {
         assertNull(validateLogin(), "open once the startup run finished")
     }
 
+    /** Records the messages of every kick: MockBukkit fills the event's reason and leave message the other way round. */
+    class KickWatcher : org.bukkit.event.Listener {
+        val kicks = mutableListOf<Set<String>>()
+
+        @org.bukkit.event.EventHandler
+        fun onKick(event: org.bukkit.event.player.PlayerKickEvent) {
+            val plain = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText()
+            kicks.add(setOfNotNull(event.reason(), event.leaveMessage()).map(plain::serialize).toSet())
+        }
+    }
+
+    @Test fun `a player who reaches the join while the gate is closed is kicked with the login message`() {
+        // Paper's legacy PlayerLoginEvent path can replace the final validate-login refusal (a handler that allows a
+        // login vanilla refused), so the join itself is checked as well.
+        load("migrations.login-message" to "Starting up")
+        val watcher = KickWatcher()
+        server.pluginManager.registerEvents(watcher, MockBukkit.createMockPlugin("Watcher"))
+        // A bypass plugin allows the login again; MockBukkit has no configuration phase, so the player reaches the join.
+        server.pluginManager.registerEvents(AllowingListener(), MockBukkit.createMockPlugin("Consumer"))
+        val early = server.addPlayer()
+        assertTrue(watcher.kicks.single().contains("Starting up"), watcher.kicks.toString())
+        assertFalse(early.isOnline)
+        tickUntil { validateLogin() == null }
+        val later = server.addPlayer()
+        assertTrue(later.isOnline, "open once the startup run finished")
+        assertEquals(1, watcher.kicks.size)
+    }
+
     @Test fun `the listener refuses with the configured message and lets logins through once open`() {
         val gate = LoginGate("Closed for now")
         val listener = LoginGateListener(gate)
