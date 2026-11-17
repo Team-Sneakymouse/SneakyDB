@@ -29,6 +29,7 @@ class PostgreSqlMigrationTest {
     private val database = "sneakydb_migration_test_${System.nanoTime()}"
     private val settings get() = admin!!.copy(database = database)
     private val sessions = mutableListOf<DatabaseSession>()
+    private val coordinators = mutableListOf<MigrationCoordinator>()
     private val info = CopyOnWriteArrayList<String>()
     private val severe = CopyOnWriteArrayList<String>()
 
@@ -53,6 +54,7 @@ class PostgreSqlMigrationTest {
 
     @AfterEach fun dropDatabase() {
         if (admin == null) return
+        coordinators.forEach { it.close() }
         sessions.forEach { it.close() }
         Thread.sleep(200) // pool closure runs on its own thread
         connect(admin.database).use { c -> c.createStatement().use { it.execute("drop database if exists $database with (force)") } }
@@ -310,6 +312,150 @@ class PostgreSqlMigrationTest {
             connect(admin!!.database).use { c -> c.createStatement().use { it.execute("drop database if exists $database with (force)") } }
             sql2("drop role if exists sneakydb_limited")
         }
+    }
+
+    /**
+     * A server in apply mode whose store runs [between] once, after the read it plans from and before its first write:
+     * what another server does while this one plans.
+     */
+    private fun interleaved(between: () -> Unit): MigrationCoordinator {
+        val session = startDatabaseSession(DatabaseConfig("postgresql", settings), MigrationSettings.DEFAULTS, info::add, severe::add) {}
+        sessions.add(session)
+        val inner = PostgreSqlMigrationStore(session)
+        var first = true
+        val store = object : MigrationStore by inner {
+            override fun readApplied(mode: MigrationMode): Map<String, List<AppliedVersion>> =
+                inner.readApplied(mode).also { if (first) { first = false; between() } }
+        }
+        return MigrationCoordinator(MigrationSettings.DEFAULTS, store, session::whenReady, info::add, severe::add).also { coordinators.add(it) }
+    }
+
+    /** Another server applies [files] as [plugin]'s scripts and finishes. */
+    private fun otherServerApplies(plugin: String, vararg files: Pair<String, String>) {
+        val other = session()
+        val done = other.add(plugin, *files)
+        other.registrationClosed()
+        done.await()
+    }
+
+    private val plotsV3 = "V003__more.sql" to "create table plot_more (id integer);"
+
+    @Test fun `an older jar fails when another server moved the database past it while it planned`() {
+        val older = interleaved { otherServerApplies("plots", *plotsScripts, plotsV3) }
+        val plots = older.add("plots", *plotsScripts)
+        older.registrationClosed()
+        val message = failure(plots)
+        assertTrue(message.contains("the database is newer than this build: it is at version 3, this build's scripts go up to 2"), message)
+        assertFalse(older.startup.get(30, TimeUnit.SECONDS))
+
+        sql("drop table plot_more, plots; delete from sneakydb.schema_migrations")
+        val oldest = interleaved { otherServerApplies("plots", *plotsScripts) }
+        val v1Only = oldest.add("plots", plotsScripts[0])
+        oldest.registrationClosed()
+        assertTrue(failure(v1Only).contains("it is at version 2, this build's scripts go up to 1"))
+    }
+
+    private fun operatorRow() {
+        sql("""create table sneakydb.schema_migrations (plugin text not null, version integer not null, name text not null,
+               checksum text, applied_at timestamptz not null default now(), primary key (plugin, version))""")
+        sql("insert into sneakydb.schema_migrations (plugin, version, name) values ('plots', 1, 'existing tables')")
+    }
+
+    @Test fun `a checksum another server filled in from a different script fails the plugin`() {
+        operatorRow()
+        val server = interleaved { sql("update sneakydb.schema_migrations set checksum = '${"0".repeat(64)}' where plugin = 'plots'") }
+        val plots = server.add("plots", plotsScripts[0])
+        server.registrationClosed()
+        val message = failure(plots)
+        assertTrue(message.contains("V001__init.sql differs from the script that was applied (checksum mismatch)"), message)
+        assertEquals(listOf("0".repeat(64)), rows("select checksum from sneakydb.schema_migrations") { it.getString(1) })
+        assertFalse(server.startup.get(30, TimeUnit.SECONDS))
+    }
+
+    @Test fun `a plugin with nothing pending is ready only after its checksum fill-in succeeded`() {
+        operatorRow()
+        sql("create role sneakydb_noupdate login password 'noupdate'")
+        try {
+            sql("grant connect on database $database to sneakydb_noupdate")
+            sql("grant usage on schema sneakydb to sneakydb_noupdate")
+            sql("grant select, insert on sneakydb.schema_migrations to sneakydb_noupdate")
+            val limited = settings.copy(username = "sneakydb_noupdate", password = "noupdate")
+            val session = startDatabaseSession(DatabaseConfig("postgresql", limited), MigrationSettings.DEFAULTS, info::add, severe::add) {}
+            sessions.add(session)
+            val coordinator = session.migrations!!
+            val plots = coordinator.add("plots", plotsScripts[0])
+            coordinator.registrationClosed()
+            val message = failure(plots)
+            assertTrue(message.contains("SQL state 42501"), message)
+            assertFalse(coordinator.startup.get(30, TimeUnit.SECONDS))
+        } finally {
+            sessions.forEach { it.close() }
+            sessions.clear()
+            Thread.sleep(200)
+            connect(admin!!.database).use { c -> c.createStatement().use { it.execute("drop database if exists $database with (force)") } }
+            sql2("drop role if exists sneakydb_noupdate")
+        }
+    }
+
+    /** A script registered as is, without the checks parsing does: what a script that slips past them would do. */
+    private fun MigrationCoordinator.unchecked(plugin: String, name: String, text: String): CompletableFuture<Int> =
+        register(plugin) { listOf(MigrationScript(1, name, text, sha256(text), emptyList())) }
+
+    @Test fun `a script that commits and then fails is reported as possibly half applied`() {
+        val coordinator = session()
+        val plots = coordinator.unchecked("plots", "V001__init.sql", "create table plots_early (id int);\ncommit;\ninsert into missing_table values (1);")
+        coordinator.registrationClosed()
+        val message = failure(plots)
+        assertTrue(message.contains("V001__init.sql ended the transaction SneakyDB runs it in"), message)
+        assertTrue(message.contains("may hold part of its changes"), message)
+        assertTrue(message.contains("SQL state 42P01"), message)
+        assertEquals(emptyList<String>(), versions())
+    }
+
+    @Test fun `a script that rolls back and continues is not recorded`() {
+        val coordinator = session()
+        val plots = coordinator.unchecked("plots", "V001__init.sql", "create table plots_a (id int);\nrollback;\ncreate table plots_b (id int);")
+        coordinator.registrationClosed()
+        assertTrue(failure(plots).contains("V001__init.sql ended the transaction SneakyDB runs it in"))
+        assertEquals(emptyList<String>(), versions())
+        assertTrue(exists("plots_b"), "the part after the rollback ran in a transaction of its own: the database holds part of the script")
+    }
+
+    @Test fun `BEGIN and END inside function bodies and DO blocks run`() {
+        val coordinator = session()
+        val plots = coordinator.add("plots", "V001__functions.sql" to """
+            create function plots_one() returns int language plpgsql as $$ begin return 1; end $$;
+            do $$ begin perform plots_one(); end $$;
+            create function plots_two() returns int language sql begin atomic select case when true then 2 end; end;
+        """.trimIndent())
+        coordinator.registrationClosed()
+        assertEquals(1, plots.await())
+        assertEquals(listOf(2), rows("select plots_two()") { it.getInt(1) })
+    }
+
+    @Test fun `requires-if-present on a plugin that another server installed while this one planned fails with restart advice`() {
+        val server = interleaved { otherServerApplies("meta", "V001__meta.sql" to "create table meta_table (id int);") }
+        val alpha = server.add("alpha", "V001__alpha.sql" to "-- requires-if-present: meta >= 2\ncreate table alpha_table (id int);")
+        server.registrationClosed()
+        val message = failure(alpha)
+        assertTrue(message.contains("meta had no rows when this server planned its migrations"), message)
+        assertTrue(message.contains("restart the server"), message)
+        assertFalse(exists("alpha_table"))
+    }
+
+    @Test fun `a plugin whose startup migration failed still counts as installed for later registrations`() {
+        val coordinator = session()
+        val broken = coordinator.add("broken", "V001__broken.sql" to "insert into missing_table values (1);")
+        coordinator.registrationClosed()
+        failure(broken)
+        val optional = coordinator.add("optional", "V001__optional.sql" to "-- requires-if-present: broken >= 1\ncreate table optional_table (id int);")
+        val message = failure(optional)
+        assertTrue(message.contains("broken's migrations failed earlier on this server"), message)
+        assertFalse(exists("optional_table"))
+        val hard = coordinator.add("hard", "V001__hard.sql" to "-- requires: broken >= 1\ncreate table hard_table (id int);")
+        val hardMessage = failure(hard)
+        assertTrue(hardMessage.contains("broken's migrations failed earlier on this server"), hardMessage)
+        assertFalse(hardMessage.contains("has not registered"), hardMessage)
     }
 
     private fun sql2(statement: String) = connect(admin!!.database).use { c -> c.createStatement().use { it.execute(statement) } }

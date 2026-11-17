@@ -21,33 +21,46 @@ class MigrationCoordinatorTest {
         override fun awaitTermination(timeout: Long, unit: TimeUnit) = true
     }
 
-    /** The version table in memory; [failing] scripts throw a PostgreSQL-style error instead of applying. */
+    /**
+     * The version table in memory, with the same under-lock re-checks as the PostgreSQL store; [failing] scripts throw a
+     * PostgreSQL-style error instead of applying.
+     */
     internal class FakeStore : MigrationStore {
         val rows = sortedMapOf<String, MutableMap<Int, String?>>()
         val log = mutableListOf<String>()
         val failing = mutableSetOf<String>()
         var readFailure: Throwable? = null
+        var fillFailure: Throwable? = null
         val modes = mutableListOf<MigrationMode>()
+
+        private fun snapshot() = rows.mapValues { (_, versions) -> versions.map { AppliedVersion(it.key, it.value) } }
 
         override fun readApplied(mode: MigrationMode): Map<String, List<AppliedVersion>> {
             modes.add(mode)
             readFailure?.let { throw it }
-            return rows.mapValues { (_, versions) -> versions.map { AppliedVersion(it.key, it.value) } }
+            return snapshot()
         }
 
-        override fun fillChecksums(plugin: String, fills: List<Pair<Int, String>>) {
-            log.add("fill $plugin ${fills.map { it.first }}")
-            fills.forEach { (version, checksum) -> rows.getValue(plugin)[version] = checksum }
+        override fun fillChecksums(plugin: String, scripts: List<MigrationScript>): List<Int> {
+            fillFailure?.let { throw it }
+            val versions = recheckFill(plugin, scripts, snapshot())
+            log.add("fill $plugin $versions")
+            versions.forEach { rows.getValue(plugin)[it] = scripts[it - 1].checksum }
+            return versions
         }
 
         override fun apply(step: PlannedStep, lockTimeoutSeconds: Int): Boolean {
             val name = step.toString()
             if (name in failing) throw SQLException("ERROR: relation \"missing\" does not exist\n  Position: 15", "42P01")
-            val own = rows.getOrPut(step.plugin) { mutableMapOf() }
-            if (step.script.version in own) return false
-            own[step.script.version] = step.script.checksum
+            if (!recheckStep(step, snapshot())) return false
+            rows.getOrPut(step.plugin) { mutableMapOf() }[step.script.version] = step.script.checksum
             log.add(name)
             return true
+        }
+
+        override fun confirmReady(plugin: String, scripts: List<MigrationScript>) {
+            recheckReady(plugin, scripts, snapshot())
+            log.add("ready $plugin")
         }
     }
 
@@ -73,7 +86,7 @@ class MigrationCoordinatorTest {
         assertFalse(alpha.isDone, "registration alone runs nothing")
         assertTrue(store.log.isEmpty())
         coordinator.registrationClosed()
-        assertEquals(listOf("alpha:V1__s1.sql", "beta:V1__s1.sql", "alpha:V2__s2.sql", "beta:V2__s2.sql", "alpha:V3__s3.sql"), store.log)
+        assertEquals(listOf("alpha:V1__s1.sql", "beta:V1__s1.sql", "alpha:V2__s2.sql", "beta:V2__s2.sql", "ready beta", "alpha:V3__s3.sql", "ready alpha"), store.log)
         assertEquals(3, alpha.join())
         assertEquals(2, beta.join())
         assertTrue(coordinator.startup.join())
@@ -95,7 +108,7 @@ class MigrationCoordinatorTest {
         val again = second.register("alpha", "", "")
         second.registrationClosed()
         assertEquals(2, again.join())
-        assertTrue(store.log.isEmpty())
+        assertEquals(listOf("ready alpha"), store.log, "nothing applied, only the check under the lock")
     }
 
     @Test fun `no registrations opens the startup result as soon as registration closes, even before readiness`() {
@@ -113,7 +126,7 @@ class MigrationCoordinatorTest {
         val beta = coordinator.register("beta", "-- requires: alpha >= 2")
         val gamma = coordinator.register("gamma", "", "")
         coordinator.registrationClosed()
-        assertEquals(listOf("alpha:V1__s1.sql", "gamma:V1__s1.sql", "gamma:V2__s2.sql"), store.log)
+        assertEquals(listOf("alpha:V1__s1.sql", "gamma:V1__s1.sql", "gamma:V2__s2.sql", "ready gamma"), store.log)
         assertEquals("Migrations for alpha failed at V2__s2.sql: SQL state 42P01: ERROR: relation \"missing\" does not exist; Position: 15", failureOf(alpha))
         assertEquals("Migrations for beta failed at V1__s1.sql: not run because it requires alpha:V2__s2.sql, which failed", failureOf(beta))
         assertEquals(2, gamma.join())
@@ -130,7 +143,7 @@ class MigrationCoordinatorTest {
         val broken = coordinator.register("broken") { throw MigrationException("broken: no migration scripts found") }
         val gamma = coordinator.register("gamma", "")
         coordinator.registrationClosed()
-        assertEquals(listOf("gamma:V1__s1.sql"), store.log)
+        assertEquals(listOf("gamma:V1__s1.sql", "ready gamma"), store.log)
         assertTrue(failureOf(alpha).contains("form a cycle"))
         assertTrue(failureOf(beta).contains("form a cycle"))
         assertEquals("Migrations for broken failed: broken: no migration scripts found", failureOf(broken))
@@ -185,7 +198,7 @@ class MigrationCoordinatorTest {
         assertTrue(coordinator.startup.join())
         val late = coordinator.register("late", "", "")
         assertEquals(2, late.join())
-        assertEquals(listOf("late:V1__s1.sql", "late:V2__s2.sql"), store.log)
+        assertEquals(listOf("late:V1__s1.sql", "late:V2__s2.sql", "ready late"), store.log)
         assertTrue(info.last().startsWith("Migrations (late registration of late, apply mode): 2 scripts applied"), info.last())
 
         store.failing.add("failing:V1__s1.sql")
@@ -203,7 +216,7 @@ class MigrationCoordinatorTest {
         coordinator.registrationClosed()
         assertEquals(1, first.join())
         assertEquals(2, coordinator.register("alpha", "", "").join(), "re-enabled with a newer build")
-        assertEquals(listOf("alpha:V1__s1.sql", "alpha:V2__s2.sql"), store.log)
+        assertEquals(listOf("alpha:V1__s1.sql", "ready alpha", "alpha:V2__s2.sql", "ready alpha"), store.log)
     }
 
     @Test fun `plugin ids must be lower-case identifiers`() {
@@ -226,7 +239,7 @@ class MigrationCoordinatorTest {
         assertEquals(1, alpha.join())
         assertTrue(failureOf(beta).contains("verify mode"))
         assertEquals(listOf(MigrationMode.VERIFY), store.modes)
-        assertTrue(store.log.isEmpty(), "no checksum fill, no script")
+        assertEquals(listOf("ready alpha"), store.log, "no checksum fill, no script")
         assertNull(store.rows.getValue("alpha")[1])
     }
 
@@ -237,14 +250,43 @@ class MigrationCoordinatorTest {
         val alpha = coordinator.register("alpha", "", "")
         coordinator.registrationClosed()
         assertEquals(2, alpha.join())
-        assertEquals(listOf("fill alpha [1]", "alpha:V2__s2.sql"), store.log)
+        assertEquals(listOf("fill alpha [1]", "alpha:V2__s2.sql", "ready alpha"), store.log)
         assertNotNull(store.rows.getValue("alpha")[1])
+    }
+
+    @Test fun `a plugin with nothing pending completes only after its checksum fill-in succeeded`() {
+        ready.complete(null)
+        store.rows["alpha"] = mutableMapOf(1 to null)
+        store.fillFailure = SQLException("ERROR: permission denied for table schema_migrations", "42501")
+        val coordinator = coordinator()
+        val alpha = coordinator.register("alpha", "")
+        coordinator.registrationClosed()
+        assertEquals("Migrations for alpha failed: SQL state 42501: ERROR: permission denied for table schema_migrations", failureOf(alpha))
+        assertFalse(coordinator.startup.join())
+        assertTrue(store.log.isEmpty(), "never declared ready")
+    }
+
+    @Test fun `a plugin whose rows stopped matching its jar under the lock fails instead of completing`() {
+        ready.complete(null)
+        store.rows["alpha"] = mutableMapOf()
+        // Another server applies alpha 1 and 2 after this server read the table: this server's jar only has 1.
+        val racing = object : MigrationStore by store {
+            override fun readApplied(mode: MigrationMode) = store.readApplied(mode).also {
+                store.rows["alpha"] = mutableMapOf(1 to null, 2 to null)
+            }
+        }
+        val coordinator = MigrationCoordinator(MigrationSettings.DEFAULTS, racing, { ready }, info::add, severe::add, Inline())
+        val alpha = coordinator.register("alpha", "")
+        coordinator.registrationClosed()
+        assertTrue(failureOf(alpha).contains("the database is newer than this build: it is at version 2, this build's scripts go up to 1"))
+        assertFalse(coordinator.startup.join())
     }
 
     @Test fun `a script another server applied meanwhile is skipped and counted`() {
         ready.complete(null)
+        // Another server applies alpha 1 after this server read the table.
         val racing = object : MigrationStore by store {
-            override fun apply(step: PlannedStep, lockTimeoutSeconds: Int): Boolean = false
+            override fun readApplied(mode: MigrationMode) = store.readApplied(mode).also { store.rows["alpha"] = mutableMapOf(1 to null) }
         }
         val coordinator = MigrationCoordinator(MigrationSettings.DEFAULTS, racing, { ready }, info::add, severe::add, Inline())
         val alpha = coordinator.register("alpha", "")

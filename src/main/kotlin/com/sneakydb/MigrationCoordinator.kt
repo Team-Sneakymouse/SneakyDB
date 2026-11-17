@@ -48,14 +48,20 @@ internal interface MigrationStore {
      */
     fun readApplied(mode: MigrationMode): Map<String, List<AppliedVersion>>
 
-    /** Fills operator rows that have no checksum yet. */
-    fun fillChecksums(plugin: String, fills: List<Pair<Int, String>>)
+    /**
+     * Under the migration lock: re-checks [plugin]'s rows against [scripts] ([recheckFill]) and records the jar's
+     * checksum on its rows that have none (operator rows). Returns their versions.
+     */
+    fun fillChecksums(plugin: String, scripts: List<MigrationScript>): List<Int>
 
     /**
      * Applies [step] and records its version in one transaction, under the migration lock and after re-checking what is
-     * applied. Returns false when another server applied it in the meantime.
+     * applied ([recheckStep]). Returns false when another server applied it in the meantime.
      */
     fun apply(step: PlannedStep, lockTimeoutSeconds: Int): Boolean
+
+    /** Under the migration lock, writing nothing: throws unless [plugin]'s rows are exactly [scripts] ([recheckReady]). */
+    fun confirmReady(plugin: String, scripts: List<MigrationScript>)
 }
 
 /** Refuses logins from SneakyDB's enable until the startup migration run has finished without failures. */
@@ -94,6 +100,8 @@ internal class MigrationCoordinator(
     private var stopped = false
     private val startupBatch = mutableListOf<Registration>()
     private val pending = HashMap<String, Registration>()
+    /** Every plugin that registered in this enable generation, with the reason its latest registration failed, if it did. */
+    private val generation = HashMap<String, String?>()
     val startup = CompletableFuture<Boolean>()
 
     fun register(plugin: String, anchor: Class<*>): CompletableFuture<Int> = register(plugin) { discoverMigrationScripts(plugin, anchor) }
@@ -117,10 +125,16 @@ internal class MigrationCoordinator(
                 return result
             }
             pending[plugin] = registration
+            generation.putIfAbsent(plugin, null)
             if (registering) startupBatch.add(registration)
             !registering
         }
-        result.whenComplete { _, _ -> synchronized(lock) { pending.remove(plugin, registration) } }
+        result.whenComplete { _, failure ->
+            synchronized(lock) {
+                pending.remove(plugin, registration)
+                generation[plugin] = failure?.let { describeFailure(it) }
+            }
+        }
         if (late) submit(listOf(registration), "late registration of $plugin", startupRun = false)
         return result
     }
@@ -193,20 +207,23 @@ internal class MigrationCoordinator(
             batch.forEach { run.fail(it.plugin, null, describeFailure(error)) }
             return run.finish(label, started)
         }
-        val plan = planMigrations(discovered, applied, settings.mode)
+        // Plugins of earlier batches of this generation count as present, failed ones included.
+        val earlier = synchronized(lock) { generation.filterKeys { it !in discovered } }
+        val plan = planMigrations(discovered, applied, settings.mode, earlier)
         plan.failures.forEach { (plugin, failure) -> run.fail(plugin, failure.script, failure.reason) }
-        val remaining = plan.steps.groupingBy { it.plugin }.eachCount().toMutableMap()
-        plan.targetVersions.forEach { (plugin, version) -> if (plugin !in remaining) run.complete(plugin, version) }
 
-        for ((plugin, fills) in plan.checksumFills) {
+        for (plugin in plan.checksumFills) {
             try {
-                store.fillChecksums(plugin, fills)
-                info("Recorded checksums for $plugin's operator-recorded versions ${fills.map { it.first }}.")
+                val filled = store.fillChecksums(plugin, plan.scripts.getValue(plugin))
+                if (filled.isNotEmpty()) info("Recorded checksums for $plugin's operator-recorded versions $filled.")
             } catch (error: Throwable) {
                 run.fail(plugin, null, describeFailure(error))
                 plan.steps.firstOrNull { it.plugin == plugin }?.let { run.skipFrom(it.key, plan, "$plugin's checksum update") }
             }
         }
+        // A plugin is declared ready only after its checksum fill-in and a check of its rows under the lock.
+        val remaining = plan.steps.groupingBy { it.plugin }.eachCount().toMutableMap()
+        plan.scripts.keys.filter { it !in remaining }.forEach { run.ready(it, plan) }
         for (step in plan.steps) {
             if (step.key in run.skipped || step.plugin in run.failed) continue
             val begun = System.nanoTime()
@@ -224,7 +241,7 @@ internal class MigrationCoordinator(
                 continue
             }
             val left = remaining.merge(step.plugin, -1, Int::plus)!!
-            if (left == 0) run.complete(step.plugin, plan.targetVersions.getValue(step.plugin))
+            if (left == 0) run.ready(step.plugin, plan)
         }
         return run.finish(label, started)
     }
@@ -237,9 +254,18 @@ internal class MigrationCoordinator(
         var applied = 0
         var skippedByOthers = 0
 
-        fun complete(plugin: String, version: Int) {
+        /** Completes [plugin] with its schema version once its rows match its jar under the lock; fails it otherwise. */
+        fun ready(plugin: String, plan: MigrationPlan) {
+            if (plugin in failed) return
+            val scripts = plan.scripts.getValue(plugin)
+            try {
+                store.confirmReady(plugin, scripts)
+            } catch (error: Throwable) {
+                fail(plugin, null, describeFailure(error))
+                return
+            }
             completed.add(plugin)
-            registrations[plugin]?.result?.complete(version)
+            registrations[plugin]?.result?.complete(scripts.size)
         }
 
         fun fail(plugin: String, script: String?, reason: String) {

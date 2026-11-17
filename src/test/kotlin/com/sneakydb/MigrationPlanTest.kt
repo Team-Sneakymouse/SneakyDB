@@ -103,7 +103,7 @@ class MigrationPlanTest {
         assertEquals(listOf("meta:V1__s1.sql", "meta:V2__s2.sql", "alpha:V1__s1.sql"), registeredWithScripts.order)
 
         val registeredTooOld = plan(plugin("alpha", "-- requires-if-present: meta >= 2"), plugin("meta", ""))
-        assertEquals(setOf("alpha"), registeredTooOld.failures.keys)
+        assertEquals(setOf("alpha", "meta"), registeredTooOld.failures.keys, "meta's pending script is in alpha's group")
     }
 
     @Test fun `a group with an unresolvable requirement fails as a whole, other groups still run`() {
@@ -111,6 +111,16 @@ class MigrationPlanTest {
         val plan = plan(plugin("alpha", "", "-- requires: missing >= 1"), plugin("beta", "-- requires: alpha >= 2"), plugin("gamma", ""))
         assertEquals(listOf("gamma:V1__s1.sql"), plan.order)
         assertEquals(setOf("alpha", "beta"), plan.failures.keys)
+        assertTrue(plan.failures.getValue("beta").reason.startsWith("not run because scripts it is grouped with by requires lines can't run"))
+        assertEquals(mapOf("gamma" to 1), plan.targetVersions)
+    }
+
+    @Test fun `an unresolvable requirement stops its whole group, including the plugin it names`() {
+        // alpha 2 needs beta 3, but beta only ships 1 and 2: beta's scripts don't run either.
+        val plan = plan(plugin("alpha", "", "-- requires: beta >= 3"), plugin("beta", "", ""), plugin("gamma", ""))
+        assertEquals(listOf("gamma:V1__s1.sql"), plan.order)
+        assertEquals(setOf("alpha", "beta"), plan.failures.keys)
+        assertTrue(plan.failures.getValue("alpha").reason.contains("needs requires: beta >= 3"))
         assertTrue(plan.failures.getValue("beta").reason.startsWith("not run because scripts it is grouped with by requires lines can't run"))
         assertEquals(mapOf("gamma" to 1), plan.targetVersions)
     }
@@ -140,7 +150,7 @@ class MigrationPlanTest {
 
         val alphaScripts = plugin("alpha", "", "")
         val operator = plan(alphaScripts, applied = mapOf("alpha" to listOf(AppliedVersion(1, null))))
-        assertEquals(mapOf("alpha" to listOf(1 to alphaScripts.second.getOrThrow()[0].checksum)), operator.checksumFills)
+        assertEquals(listOf("alpha"), operator.checksumFills)
         assertEquals(listOf("alpha:V2__s2.sql"), operator.order)
 
         val verify = plan(alphaScripts, applied = mapOf("alpha" to listOf(AppliedVersion(1, null), AppliedVersion(2, null))), mode = MigrationMode.VERIFY)

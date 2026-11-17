@@ -43,64 +43,63 @@ internal class PostgreSqlMigrationStore(private val session: DatabaseSession) : 
             lock(connection)
             connection.createStatement().use { it.execute(CREATE_TABLE) }
         }
-        connection.prepareStatement("select plugin, version, checksum from sneakydb.schema_migrations").use { statement ->
-            statement.executeQuery().use { rows ->
-                val result = HashMap<String, MutableList<AppliedVersion>>()
-                while (rows.next()) result.getOrPut(rows.getString(1)) { mutableListOf() }.add(AppliedVersion(rows.getInt(2), rows.getString(3)))
-                result
-            }
-        }
+        readAll(connection)
     })
 
-    override fun fillChecksums(plugin: String, fills: List<Pair<Int, String>>) = await(session.inTransaction { scope ->
-        lock(scope.connection)
-        scope.connection.prepareStatement(
+    override fun fillChecksums(plugin: String, scripts: List<MigrationScript>): List<Int> = await(session.inTransaction { scope ->
+        val connection = scope.connection
+        lock(connection)
+        // Another server may have filled them meanwhile, from a different script: recheckFill compares those.
+        val versions = recheckFill(plugin, scripts, readAll(connection))
+        connection.prepareStatement(
             "update sneakydb.schema_migrations set checksum = ? where plugin = ? and version = ? and checksum is null",
         ).use { statement ->
-            for ((version, checksum) in fills) {
-                statement.setString(1, checksum)
+            for (version in versions) {
+                statement.setString(1, scripts[version - 1].checksum)
                 statement.setString(2, plugin)
                 statement.setInt(3, version)
                 statement.executeUpdate()
             }
         }
+        versions
+    })
+
+    override fun confirmReady(plugin: String, scripts: List<MigrationScript>) = await(session.inTransaction { scope ->
+        val connection = scope.connection
+        lock(connection)
+        val tableExists = single(connection, "select to_regclass('sneakydb.schema_migrations') is not null") { it.getBoolean(1) }
+        recheckReady(plugin, scripts, if (tableExists) readAll(connection) else emptyMap())
     })
 
     override fun apply(step: PlannedStep, lockTimeoutSeconds: Int): Boolean = await(session.inTransaction { scope ->
         val connection = scope.connection
         val script = step.script
         lock(connection)
-        // Re-check under the lock: another server may have applied this or earlier scripts since the plan was made.
-        val rows = HashMap<Int, String?>()
-        connection.prepareStatement("select version, checksum from sneakydb.schema_migrations where plugin = ?").use { statement ->
-            statement.setString(1, step.plugin)
-            statement.executeQuery().use { while (it.next()) rows[it.getInt(1)] = it.getString(2) }
-        }
-        if (script.version in rows) {
-            val stored = rows[script.version]
-            if (stored != null && stored != script.checksum) throw MigrationException(
-                "another server applied a different ${script.fileName} (checksum mismatch); a merged script must never be edited: " +
-                    "restore the original and put the change in a new script")
-            return@inTransaction false
-        }
-        val current = rows.keys.maxOrNull() ?: 0
-        if (current != script.version - 1) throw MigrationException(
-            "expected ${step.plugin} at version ${script.version - 1} before this script, but the database has version $current; restart the server")
-        for (requirement in step.requirements) {
-            val version = single(connection, "select coalesce(max(version), 0) from sneakydb.schema_migrations where plugin = ?", requirement.plugin) {
-                it.getInt(1)
-            }
-            if (version < requirement.version) throw MigrationException(
-                "it needs $requirement, but the database has ${requirement.plugin} at version $version; restart the server")
-        }
+        // Re-check under the lock: another server may have applied this or other scripts since the plan was made.
+        if (!recheckStep(step, readAll(connection))) return@inTransaction false
         connection.prepareStatement("select set_config('lock_timeout', ?, true)").use {
             it.setString(1, "${lockTimeoutSeconds}s")
             it.executeQuery().close()
         }
         scope.checkActive()
-        connection.createStatement().use { statement ->
-            statement.setEscapeProcessing(false) // run the file exactly as written, without JDBC {escape} rewriting
-            statement.execute(script.text)
+        val transaction = currentTransaction(connection)
+        try {
+            connection.createStatement().use { statement ->
+                statement.setEscapeProcessing(false) // run the file exactly as written, without JDBC {escape} rewriting
+                statement.execute(script.text)
+            }
+        } catch (error: java.sql.SQLException) {
+            // Normally the failed script leaves its own transaction aborted, and the probe fails with 25P02.
+            if (runCatching { currentTransaction(connection) != transaction }.getOrDefault(false)) {
+                scope.discard = true
+                throw MigrationException("${endedTransaction(script)}; then it failed: ${describeFailure(error)}")
+            }
+            throw error
+        }
+        if (currentTransaction(connection) != transaction) {
+            // Session settings the script set before ending its transaction would survive; don't reuse the connection.
+            scope.discard = true
+            throw MigrationException(endedTransaction(script))
         }
         scope.checkActive()
         // Session-level SET in a script would otherwise outlive it on this pooled connection.
@@ -116,6 +115,24 @@ internal class PostgreSqlMigrationStore(private val session: DatabaseSession) : 
         }
         true
     })
+
+    private fun endedTransaction(script: MigrationScript) =
+        "${script.fileName} ended the transaction SneakyDB runs it in (COMMIT, ROLLBACK or similar), so its version was not " +
+            "recorded and the database may hold part of its changes; check them by hand, remove the transaction control from " +
+            "the script, and undo or complete the partial changes before restarting"
+
+    /** The id of the transaction [connection] is in; a script that ends its transaction makes the next call return another. */
+    private fun currentTransaction(connection: Connection): Long = single(connection, "select txid_current()") { it.getLong(1) }
+
+    /** Every row of the version table, by plugin. */
+    private fun readAll(connection: Connection): Map<String, List<AppliedVersion>> =
+        connection.prepareStatement("select plugin, version, checksum from sneakydb.schema_migrations").use { statement ->
+            statement.executeQuery().use { rows ->
+                val result = HashMap<String, MutableList<AppliedVersion>>()
+                while (rows.next()) result.getOrPut(rows.getString(1)) { mutableListOf() }.add(AppliedVersion(rows.getInt(2), rows.getString(3)))
+                result
+            }
+        }
 
     /** Waits for the next migration lock of this database; released when the transaction ends. Not bound by lock_timeout. */
     private fun lock(connection: Connection) {
