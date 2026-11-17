@@ -15,11 +15,12 @@ internal const val MIGRATIONS_DIRECTORY = "db/migrations"
 internal val PLUGIN_ID = Regex("[a-z][a-z0-9_]{0,62}")
 private val SCRIPT_NAME = Regex("V([0-9]+)__([A-Za-z0-9][A-Za-z0-9_-]*)\\.sql")
 /**
- * A comment line is a requires directive when its first word is `requires` or `requires-if-present` (any case) followed
- * by a colon, or followed by something shaped like `<id> >= <n>` (a forgotten colon). Other comments are prose.
+ * A comment line is a requires directive when its first word is `requires` or `requires-if-present`, or the near-miss
+ * `require` or `require-if-present` (any case), followed by a colon, or followed by something shaped like `<id> >= <n>`
+ * (a forgotten colon). Other comments are prose. Only the exact lower-case forms in [REQUIREMENT] parse.
  */
 private val REQUIREMENT_LINE = Regex(
-    "--\\s*(requires|requires-if-present)(\\s*:.*|\\s+[A-Za-z_][A-Za-z0-9_]*\\s*(>=|=>|<=|>|<|=).*)", RegexOption.IGNORE_CASE)
+    "--\\s*(requires?|requires?-if-present)(\\s*:.*|\\s+[A-Za-z_][A-Za-z0-9_]*\\s*(>=|=>|<=|>|<|=).*)", RegexOption.IGNORE_CASE)
 private val REQUIREMENT = Regex("--\\s*(requires|requires-if-present):\\s*([a-z][a-z0-9_]{0,62})\\s*>=\\s*([0-9]{1,9})\\s*")
 
 /** A failure whose message tells the plugin author or operator what to do. Never carries credentials. */
@@ -165,11 +166,15 @@ private val DOLLAR_TAG = Regex("\\$([A-Za-z_\\u0080-\\uffff][A-Za-z0-9_\\u0080-\
 /**
  * The first top-level statement of [sql] that controls the transaction (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`,
  * `ROLLBACK`, `ABORT`, `SAVEPOINT`, `RELEASE`, `PREPARE TRANSACTION`, `COMMIT PREPARED`, `ROLLBACK PREPARED`), as its
- * line and leading words, or null. Understands PostgreSQL's `--` and nested `/* */` comments, `'…'` and `E'…'`
- * strings, `"…"` identifiers and dollar-quoted bodies, so `BEGIN … END` inside a function body or `DO` block is not a
- * statement. Like psql, a `CREATE [OR REPLACE] FUNCTION|PROCEDURE` statement with a SQL-standard body
- * (`BEGIN ATOMIC … END`) keeps its semicolons until the matching `END`, counting `CASE … END` inside it. psql counts
- * any `BEGIN` there; only `BEGIN ATOMIC` counts here, so `RETURN begin` (a parameter) can't hide a later `COMMIT`.
+ * line and leading words, or null. Reads [sql] as PostgreSQL's lexer does with `standard_conforming_strings` on (the
+ * store refuses to run scripts otherwise): `--` and nested `/* */` comments, `'…'` and `E'…'` strings, `"…"`
+ * identifiers, dollar-quoted bodies, and identifiers in which every character at or above U+0080 counts as a letter,
+ * so `€$q$` is one identifier and not the start of a dollar quote. `BEGIN … END` inside a function body or `DO` block
+ * is therefore not a statement.
+ *
+ * A `CREATE [OR REPLACE] FUNCTION|PROCEDURE` statement with a SQL-standard body keeps its semicolons from `BEGIN ATOMIC`
+ * (the two words with nothing but whitespace or comments between them) to the body's `END`. As in PostgreSQL's grammar,
+ * that is the `END` that starts a statement inside the body; a `CASE … END` or a column labelled `end` doesn't close it.
  */
 internal fun findTransactionControl(sql: String): Pair<Int, String>? = TransactionControlScanner(sql).find()
 
@@ -180,8 +185,12 @@ private class TransactionControlScanner(private val sql: String) {
     private val tokens = ArrayList<String>()
     private var statementLine = 1
     private var parens = 0
-    private var atomicDepth = 0
-    private var previousWord: String? = null
+    /** The previous token was the word `begin` in a routine's header; comments and whitespace are not tokens. */
+    private var afterBegin = false
+    /** Inside the `BEGIN ATOMIC` body of the current statement. */
+    private var inBody = false
+    /** Inside a body, before the first token of one of its statements: an `END` here closes the body. */
+    private var bodyStatementStart = false
 
     fun find(): Pair<Int, String>? {
         while (i < sql.length) {
@@ -189,19 +198,20 @@ private class TransactionControlScanner(private val sql: String) {
             val next = sql.getOrNull(i + 1)
             when {
                 c == '\n' -> { line++; i++ }
-                c.isWhitespace() -> i++
+                c == ' ' || c == '\t' || c == '\r' || c == '\u000c' || c == '\u000b' -> i++
                 c == '-' && next == '-' -> while (i < sql.length && sql[i] != '\n') i++
                 c == '/' && next == '*' -> skipBlockComment()
-                c == '\'' -> { token(""); skipQuoted('\'', backslash = false) }
-                c == '"' -> { token(""); skipQuoted('"', backslash = false) }
-                c == '$' -> { token(""); skipDollarQuoted() }
+                c == '\'' -> { other(); skipQuoted('\'', backslash = false) }
+                c == '"' -> { other(); skipQuoted('"', backslash = false) }
+                c == '$' -> { other(); skipDollarQuoted() }
                 c == ';' -> {
                     i++
-                    if (atomicDepth == 0) statementEnd()?.let { return it }
+                    if (inBody) bodyStatementStart = true
+                    else statementEnd()?.let { return it }
                 }
-                c == '_' || c.isLetter() -> word()
+                identifierStart(c) -> word()
                 else -> {
-                    token("")
+                    other()
                     if (c == '(') parens++ else if (c == ')' && parens > 0) parens--
                     i++
                 }
@@ -210,9 +220,21 @@ private class TransactionControlScanner(private val sql: String) {
         return statementEnd()
     }
 
+    /** ASCII letters, `_` and every character at or above U+0080 start an identifier or keyword, as in PostgreSQL. */
+    private fun identifierStart(c: Char) = c in 'a'..'z' || c in 'A'..'Z' || c == '_' || c >= '\u0080'
+
+    private fun identifierPart(c: Char) = identifierStart(c) || c in '0'..'9' || c == '$'
+
     private fun token(value: String) {
         if (tokens.isEmpty()) statementLine = line
         if (tokens.size < 4) tokens.add(value)
+    }
+
+    /** A token that is not a word: a string, a quoted identifier, an operator, a number or punctuation. */
+    private fun other() {
+        token("")
+        afterBegin = false
+        bodyStatementStart = false
     }
 
     private fun statementEnd(): Pair<Int, String>? {
@@ -225,29 +247,33 @@ private class TransactionControlScanner(private val sql: String) {
         }
         tokens.clear()
         parens = 0
-        atomicDepth = 0
-        previousWord = null
+        afterBegin = false
+        inBody = false
+        bodyStatementStart = false
         return found?.let { statementLine to it }
     }
 
     private fun word() {
         val start = i
-        while (i < sql.length && (sql[i] == '_' || sql[i] == '$' || sql[i].isLetterOrDigit())) i++
-        val word = sql.substring(start, i).lowercase()
+        while (i < sql.length && identifierPart(sql[i])) i++
+        // Only ASCII is lower-cased, as PostgreSQL does for keywords: a Kelvin sign doesn't turn a word into one.
+        val word = buildString { for (index in start until i) sql[index].let { append(if (it in 'A'..'Z') it + 32 else it) } }
         if (word == "e" && sql.getOrNull(i) == '\'') {
-            token("")
+            other()
             skipQuoted('\'', backslash = true)
             return
         }
         token(word)
-        val previous = previousWord
-        previousWord = word
-        if (parens != 0 || !isRoutine()) return
-        when {
-            word == "atomic" && previous == "begin" -> atomicDepth++
-            word == "case" && atomicDepth > 0 -> atomicDepth++
-            word == "end" && atomicDepth > 0 -> atomicDepth--
+        val wasBegin = afterBegin
+        afterBegin = false
+        if (inBody) {
+            if (bodyStatementStart && word == "end") inBody = false
+            bodyStatementStart = false
+            return
         }
+        if (parens != 0 || !isRoutine()) return
+        if (word == "begin") afterBegin = true
+        else if (word == "atomic" && wasBegin) { inBody = true; bodyStatementStart = true }
     }
 
     private fun isRoutine(): Boolean = tokens.getOrNull(0) == "create" &&

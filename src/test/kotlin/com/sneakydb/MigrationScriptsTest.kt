@@ -141,6 +141,7 @@ class MigrationScriptsTest {
             -- Requirements: the plots table from V1.
             -- requires the plots table from V1
             -- Requires a restart afterwards.
+            -- require the plots table too
             create table x (id int);
             -- requires the index above
         """.trimIndent())[1]
@@ -152,7 +153,7 @@ class MigrationScriptsTest {
             "-- requires sneakycharacters >= 3", "-- requires: sneakycharacters > 3", "-- Requires: sneakycharacters >= 3",
             "-- requires: SneakyCharacters >= 3", "-- requires: sneakycharacters >= x", "-- requires-if-present sneakyusermeta >= 1",
             "-- requires: sneakycharacters >= 3, sneakyusermeta >= 1", "-- REQUIRES sneakycharacters >= 3", "-- requires sneakycharacters > 3",
-            "-- requires: the plots table",
+            "-- requires: the plots table", "-- require: core >= 1", "-- require core >= 1", "-- require-if-present: core >= 1",
         )
         for (line in malformed) {
             val message = failure("plots", "V1__a.sql" to "$line\nselect 1;")
@@ -181,6 +182,17 @@ class MigrationScriptsTest {
             "rollback prepared 'x';" to "line 1: ROLLBACK PREPARED",
             "create function d(begin int) returns int language sql return begin;\ncommit;" to "line 2: COMMIT",
             "select 'it''s';\nselect E'\\'; commit; \\'';\nselect \"a;b\";\nselect \$q\$ ; \$q\$;\n\ncommit;" to "line 6: COMMIT",
+            // begin and atomic with an operator between them are two parameters, not a BEGIN ATOMIC body.
+            "create function f(begin int, atomic int) returns int language sql return begin + atomic;\ncommit;" to "line 2: COMMIT",
+            "create function f(begin int, atomic int) returns int language sql return begin /* c */ + atomic;\ncommit;" to "line 2: COMMIT",
+            // PostgreSQL reads a character at or above U+0080 followed by a dollar tag as one identifier, not a dollar quote.
+            "select 1 as €\$q\$;\ncommit;\nselect 2 as €\$q\$;" to "line 2: COMMIT",
+            "select 1 as e\u0301\$q\$;\ncommit;\nselect 2 as e\u0301\$q\$;" to "line 2: COMMIT",
+            "select 1 as a\u00a0\$q\$;\ncommit;\nselect 2 as a\u00a0\$q\$;" to "line 2: COMMIT",
+            "select 1 as \u00e9\$q\$;\ncommit;\nselect 2 as \u00e9\$q\$;" to "line 2: COMMIT",
+            // The body ends at the END that starts a statement inside it; the next END is top-level again.
+            "create function f() returns int language sql begin atomic select 1; end;\nend;" to "line 2: END",
+            "create function f() returns int language sql begin /* c */ atomic select 1 as end; end;\ncommit;" to "line 2: COMMIT",
         )
         for ((text, where) in cases) {
             val message = failure("plots", "V1__a.sql" to text)
@@ -207,5 +219,30 @@ class MigrationScriptsTest {
             create function d(begin int) returns int language sql return begin;
         """.trimIndent()
         assertEquals(1, scripts("plots", "V1__a.sql" to text).size)
+    }
+
+    @Test fun `legitimate scripts around BEGIN ATOMIC bodies, END columns and non-ASCII identifiers pass`() {
+        val legitimate = listOf(
+            // A column alias named end inside a BEGIN ATOMIC body is a label, not the body's END.
+            "CREATE FUNCTION example() RETURNS integer LANGUAGE SQL\nBEGIN ATOMIC\n    SELECT 1 AS end;\nEND;",
+            "create function e() returns int language sql begin atomic select 1 end; end;\nselect 2;",
+            "create function e() returns int language sql begin atomic select \"end\" from t; end;",
+            "create function e() returns int language sql begin atomic select case when true then 1 else 2 end as end; select 3; end;",
+            "create function e() returns int language sql begin atomic select case when true then case when false then 1 end end end; end;",
+            "create function e() returns void language sql begin atomic end;",
+            "create function e() returns int language sql begin\n-- c\natomic select 1; end;\nselect 2;",
+            "create function e(begin int, atomic int) returns int language sql return begin + atomic;",
+            "create table t (\"end\" int, \"commit\" int);\nselect \"end\", case when true then 1 end as end from t;\nselect case when \"end\" > 0 then 'commit' end from t;",
+            "create function p() returns int language plpgsql as \$\$ begin if true then return 1; end if; end \$\$;",
+            "comment on function p() is 'commit; rollback;';\ncomment on table t is \$c\$ end; \$c\$;",
+            "select 'rollback;', E'it\\'s; rollback;', \$\$ rollback; \$\$;",
+            "prepare q as select 1;\nexecute q;\ndeallocate q;",
+            "create table café (prix€ int, été int);\nselect prix€ as €\$q from café;",
+            "select \$x1\$ commit; \$x1\$;",
+        )
+        for (text in legitimate) {
+            assertNull(findTransactionControl(text), text)
+            assertEquals(1, scripts("plots", "V1__a.sql" to text).size, text)
+        }
     }
 }
