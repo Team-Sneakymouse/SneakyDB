@@ -18,7 +18,7 @@ class PlatformIsolationTest {
         "adapter.PostgreSqlAdapter", "adapter.DatabaseAdapterKt",
         "SneakyDBTransaction", "TransactionsKt", "TransactionScope", "TransactionHandle",
         "MigrationCoordinator", "MigrationSettings", "LoginGate", "MigrationCoordinatorKt", "MigrationPlanKt",
-        "MigrationScriptsKt", "PostgreSqlMigrationStore",
+        "MigrationScriptsKt", "TransactionControlScanner", "PostgreSqlMigrationStore",
     )
 
     @Test fun `each entry point links without the other platform's API`() {

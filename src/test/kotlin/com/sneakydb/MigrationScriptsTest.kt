@@ -136,11 +136,23 @@ class MigrationScriptsTest {
         assertEquals(listOf(Requirement("sneakycharacters", 3, false), Requirement("sneakyusermeta", 5, true)), script.requirements)
     }
 
+    @Test fun `comments that merely start with the word requires are prose`() {
+        val script = scripts("plots", "V1__a.sql" to "", "V2__b.sql" to """
+            -- Requirements: the plots table from V1.
+            -- requires the plots table from V1
+            -- Requires a restart afterwards.
+            create table x (id int);
+            -- requires the index above
+        """.trimIndent())[1]
+        assertEquals(emptyList<Requirement>(), script.requirements)
+    }
+
     @Test fun `a malformed or misplaced requires line fails the plugin`() {
         val malformed = listOf(
             "-- requires sneakycharacters >= 3", "-- requires: sneakycharacters > 3", "-- Requires: sneakycharacters >= 3",
             "-- requires: SneakyCharacters >= 3", "-- requires: sneakycharacters >= x", "-- requires-if-present sneakyusermeta >= 1",
-            "-- requires: sneakycharacters >= 3, sneakyusermeta >= 1",
+            "-- requires: sneakycharacters >= 3, sneakyusermeta >= 1", "-- REQUIRES sneakycharacters >= 3", "-- requires sneakycharacters > 3",
+            "-- requires: the plots table",
         )
         for (line in malformed) {
             val message = failure("plots", "V1__a.sql" to "$line\nselect 1;")
@@ -152,5 +164,48 @@ class MigrationScriptsTest {
         assertTrue(afterBlockComment.contains("before the first SQL statement"), afterBlockComment)
         val self = failure("plots", "V1__a.sql" to "", "V2__b.sql" to "-- requires: plots >= 2\nselect 1;")
         assertTrue(self.contains("can't require its own plugin at version 2 or later"), self)
+    }
+
+    @Test fun `scripts that control the transaction at the top level fail the plugin`() {
+        val cases = listOf(
+            "begin;\ncreate table a (id int);\ncommit;" to "line 1: BEGIN",
+            "create table a (id int);\nCOMMIT;\ninsert into missing values (1);" to "line 2: COMMIT",
+            "create table a (id int);\n  rollback ;\ncreate table b (id int);" to "line 2: ROLLBACK",
+            "-- header\nstart transaction isolation level serializable;\nselect 1;" to "line 2: START TRANSACTION",
+            "select 1; end;" to "line 1: END",
+            "select 1;\nabort" to "line 2: ABORT",
+            "savepoint s;\nselect 1;" to "line 1: SAVEPOINT",
+            "select 1;\n/* a comment */ release savepoint s;" to "line 2: RELEASE",
+            "prepare transaction 'x';" to "line 1: PREPARE TRANSACTION",
+            "commit prepared 'x';" to "line 1: COMMIT PREPARED",
+            "rollback prepared 'x';" to "line 1: ROLLBACK PREPARED",
+            "create function d(begin int) returns int language sql return begin;\ncommit;" to "line 2: COMMIT",
+            "select 'it''s';\nselect E'\\'; commit; \\'';\nselect \"a;b\";\nselect \$q\$ ; \$q\$;\n\ncommit;" to "line 6: COMMIT",
+        )
+        for ((text, where) in cases) {
+            val message = failure("plots", "V1__a.sql" to text)
+            assertTrue(message.startsWith("plots: V1__a.sql $where controls the transaction"), "$text → $message")
+        }
+    }
+
+    @Test fun `transaction words inside bodies, strings, identifiers and comments are not transaction control`() {
+        val text = """
+            -- commit; rollback; begin;
+            /* outer /* nested; commit; */ still a comment; rollback; */
+            create function a() returns int language plpgsql as $$
+            begin
+                return 1;
+            end;
+            $$;
+            create or replace procedure b() language plpgsql as ${'$'}body$ begin commit; end ${'$'}body$;
+            do $$ begin perform 1; end $$;
+            do 'begin perform 1; end';
+            select 'commit; rollback;', E'it\'s; commit;', "commit;", U&'x; commit;' as end;
+            select ${'$'}1;
+            create table x (begin int, "end" int, commit${'$'}x int);
+            create function c() returns int language sql begin atomic select case when true then 1 end; select 2; end;
+            create function d(begin int) returns int language sql return begin;
+        """.trimIndent()
+        assertEquals(1, scripts("plots", "V1__a.sql" to text).size)
     }
 }
