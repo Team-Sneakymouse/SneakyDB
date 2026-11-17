@@ -1,5 +1,9 @@
 package com.sneakydb
 
+import org.bukkit.event.EventHandler
+import org.bukkit.event.EventPriority
+import org.bukkit.event.Listener
+import org.bukkit.event.server.ServerLoadEvent
 import org.bukkit.plugin.java.JavaPlugin
 
 /** Paper entry point (paper-plugin.yml). The Velocity entry point is com.sneakydb.velocity.SneakyDBVelocity. */
@@ -12,8 +16,9 @@ open class SneakyDB : JavaPlugin() {
         saveDefaultConfig()
         // An explicit null default keeps Bukkit's getX(path, default) semantics: the jar's defaults don't apply.
         val database = DatabaseConfig.read { config.get("database.$it", null) }
+        val migrations = MigrationSettings.read({ config.get("migrations.$it", null) }, logger::warning)
         val settings = database.settings
-        val generation = startDatabaseSession(database, logger::warning)
+        val generation = startDatabaseSession(database, migrations, logger::info, logger::severe, logger::warning)
         session = generation
         SneakyDBRegistry.api = generation
         val cmi = CmiMaintenance(
@@ -36,6 +41,36 @@ open class SneakyDB : JavaPlugin() {
             if (failure != null) logReadinessFailure(logger, failure)
             else if (generation.isAvailable()) logger.info("PostgreSQL adapter connected and ready.")
         }
+        val coordinator = checkNotNull(generation.migrations)
+        // Bukkit drops the listener on disable.
+        server.pluginManager.registerEvents(StartupListener { holdStartup(coordinator, fallback) }, this)
+        // Enabled after the server started (re-enable, /reload): no ServerLoadEvent at startup comes, so what registers
+        // during this enable runs at the first tick as a late batch, without holding the server thread.
+        server.scheduler.runTask(this, Runnable { coordinator.registrationClosed(startupRun = false) })
+    }
+
+    /**
+     * On the server thread, after every plugin has enabled and before the server accepts connections: runs the startup
+     * migrations while the thread waits. Ends early when SneakyDB is disabled (on shutdown, Paper disables plugins from
+     * its shutdown thread when the server thread doesn't stop within a second).
+     */
+    private fun holdStartup(coordinator: MigrationCoordinator, fallback: OutageFallback) {
+        coordinator.registrationClosed(startupRun = true)
+        when (awaitStartup(coordinator.startup)) {
+            StartupOutcome.PLUGINS_FAILED -> {
+                logger.severe("Migrations failed for some plugins outside a running script (see the lines above); those " +
+                    "plugins stay inactive. Startup continues with CMI maintenance on: once the cause is fixed and the server " +
+                    "restarted, switch it off by hand (cmi maintenance false).")
+                fallback.activateNow()
+            }
+            StartupOutcome.STOPPED -> {
+                // A health check that failed during the wait may have queued the maintenance command; Paper still runs
+                // queued tasks once before it stops. A stop leaves no maintenance behind.
+                fallback.close()
+                server.shutdown()
+            }
+            StartupOutcome.CLEAN, null -> {}
+        }
     }
 
     override fun onDisable() {
@@ -46,5 +81,18 @@ open class SneakyDB : JavaPlugin() {
         healthWorker = null
         session?.close()
         session = null
+    }
+}
+
+/**
+ * Runs [hold] at `ServerLoadEvent` with load type `STARTUP`. Paper fires it on the server thread once every plugin has
+ * enabled, right before it lets the server's network channels accept connections and before the first tick; a reload
+ * fires it with `RELOAD`, which starts nothing. Monitor priority, so registrations from handlers that ran before this
+ * one are in the startup run; a monitor handler of a plugin enabled after SneakyDB runs after the wait and registers late.
+ */
+internal class StartupListener(private val hold: () -> Unit) : Listener {
+    @EventHandler(priority = EventPriority.MONITOR)
+    fun onServerLoad(event: ServerLoadEvent) {
+        if (event.type == ServerLoadEvent.LoadType.STARTUP) hold()
     }
 }

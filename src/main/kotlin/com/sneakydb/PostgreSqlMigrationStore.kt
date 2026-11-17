@@ -1,0 +1,216 @@
+package com.sneakydb
+
+import java.sql.Connection
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CompletionException
+
+/** Advisory lock key ("SneakyDB" in ASCII) that serialises migration work of every server on one database. */
+internal const val MIGRATION_LOCK_KEY = 0x536E65616B794442L
+
+/** SQL states of a connection the server ended: admin shutdown, crash shutdown, can't connect now. Class 08 counts too. */
+private val LOST_CONNECTION_STATES = setOf("57P01", "57P02", "57P03")
+private const val CHECK_BY_HAND =
+    "check them by hand, remove the transaction control from the script, and undo or complete the partial changes before restarting"
+
+private const val CREATE_TABLE = """
+create table if not exists sneakydb.schema_migrations (
+    plugin     text        not null,
+    version    integer     not null,
+    name       text        not null,
+    checksum   text,
+    applied_at timestamptz not null default now(),
+    primary key (plugin, version)
+)"""
+
+/**
+ * The version table `sneakydb.schema_migrations` on PostgreSQL. Each call is one transaction through
+ * [DatabaseSession.inTransaction]; writes take a transaction-level advisory lock first, so servers sharing the
+ * database apply scripts one at a time and each sees what the others committed.
+ */
+internal class PostgreSqlMigrationStore(private val session: DatabaseSession) : MigrationStore {
+    override fun readApplied(mode: MigrationMode): Map<String, List<AppliedVersion>> = await(session.inTransaction { scope ->
+        val connection = scope.connection
+        val role = single(connection, "select quote_ident(current_user)") { it.getString(1) }
+        val schemaExists = single(connection, "select exists (select 1 from pg_namespace where nspname = 'sneakydb')") { it.getBoolean(1) }
+        if (!schemaExists) throw MigrationException(
+            "the schema sneakydb does not exist; as the database owner run: create schema sneakydb; " +
+                "grant usage, create on schema sneakydb to $role; then restart the server")
+        val (usage, create) = single(connection,
+            "select has_schema_privilege('sneakydb', 'USAGE'), has_schema_privilege('sneakydb', 'CREATE')") { it.getBoolean(1) to it.getBoolean(2) }
+        if (!usage) throw MigrationException(
+            "role $role may not use the schema sneakydb; as the database owner run: grant usage, create on schema sneakydb to $role; then restart the server")
+        val tableExists = single(connection, "select to_regclass('sneakydb.schema_migrations') is not null") { it.getBoolean(1) }
+        if (!tableExists) {
+            if (mode == MigrationMode.VERIFY) return@inTransaction emptyMap()
+            if (!create) throw MigrationException(
+                "sneakydb.schema_migrations is missing and role $role may not create it; as the database owner run: " +
+                    "grant usage, create on schema sneakydb to $role; then restart the server")
+            lock(connection)
+            connection.createStatement().use { it.execute(CREATE_TABLE) }
+        }
+        readAll(connection)
+    })
+
+    override fun fillChecksums(plugin: String, scripts: List<MigrationScript>): List<Int> = await(session.inTransaction { scope ->
+        val connection = scope.connection
+        lock(connection)
+        // Another server may have filled them meanwhile, from a different script: recheckFill compares those.
+        val versions = recheckFill(plugin, scripts, readAll(connection))
+        connection.prepareStatement(
+            "update sneakydb.schema_migrations set checksum = ? where plugin = ? and version = ? and checksum is null",
+        ).use { statement ->
+            for (version in versions) {
+                statement.setString(1, scripts[version - 1].checksum)
+                statement.setString(2, plugin)
+                statement.setInt(3, version)
+                statement.executeUpdate()
+            }
+        }
+        versions
+    })
+
+    override fun confirmReady(plugin: String, scripts: List<MigrationScript>) = await(session.inTransaction { scope ->
+        val connection = scope.connection
+        lock(connection)
+        val tableExists = single(connection, "select to_regclass('sneakydb.schema_migrations') is not null") { it.getBoolean(1) }
+        recheckReady(plugin, scripts, if (tableExists) readAll(connection) else emptyMap())
+    })
+
+    override fun apply(step: PlannedStep, lockTimeoutSeconds: Int): Boolean {
+        val started = java.util.concurrent.atomic.AtomicBoolean()
+        try {
+            return await(session.inTransaction { scope -> applyLocked(scope, step, lockTimeoutSeconds, started) })
+        } catch (error: Throwable) {
+            // Once the script has started, every failure is the script's, including the insert of its row and the commit.
+            if (!started.get() || error is ScriptFailedException) throw error
+            throw ScriptFailedException(describeFailure(error))
+        }
+    }
+
+    private fun applyLocked(scope: TransactionScope, step: PlannedStep, lockTimeoutSeconds: Int, started: java.util.concurrent.atomic.AtomicBoolean): Boolean {
+        val connection = scope.connection
+        val script = step.script
+        lock(connection)
+        // Re-check under the lock: another server may have applied this or other scripts since the plan was made.
+        if (!recheckStep(step, readAll(connection))) return false
+        // The check for transaction control in scripts reads strings as PostgreSQL does by default; with this off,
+        // PostgreSQL would read '\' as an escaped quote and could run a COMMIT the check took for part of a string.
+        val conforming = single(connection, "select current_setting('standard_conforming_strings')") { it.getString(1) }
+        if (conforming != "on") {
+            val (database, role) = single(connection, "select quote_ident(current_database()), quote_ident(current_user)") {
+                it.getString(1) to it.getString(2)
+            }
+            throw MigrationException(
+                "standard_conforming_strings is $conforming on the connection that would run ${script.fileName}, so the script did not " +
+                    "run: migrations need PostgreSQL's default string parsing. The usual cause is a setting on the database or the role " +
+                    "(psql's \\drds lists them). As the database owner or a superuser run: alter database $database reset " +
+                    "standard_conforming_strings; alter role $role reset standard_conforming_strings; alter role $role in database " +
+                    "$database reset standard_conforming_strings; (or remove it from postgresql.conf), then restart the server")
+        }
+        connection.prepareStatement("select set_config('lock_timeout', ?, true)").use {
+            it.setString(1, "${lockTimeoutSeconds}s")
+            it.executeQuery().close()
+        }
+        scope.checkActive()
+        val transaction = currentTransaction(connection)
+        // Lets a failed script's transaction be proven unchanged: only the transaction the savepoint was set in has it.
+        // A new random name each time, so a script can't roll back to it or release it and still look unchanged.
+        val savepoint = "sneakydb_" + java.util.UUID.randomUUID().toString().replace("-", "")
+        execute(connection, "savepoint $savepoint")
+        started.set(true)
+        try {
+            connection.createStatement().use { statement ->
+                statement.setEscapeProcessing(false) // run the file exactly as written, without JDBC {escape} rewriting
+                statement.execute(script.text)
+            }
+        } catch (error: java.sql.SQLException) {
+            // A transaction that still answers is not aborted. After a server error that means the script ended its own
+            // transaction (pgjdbc began a new one for the probe), unless the error never reached the server.
+            val unaborted = runCatching { currentTransaction(connection) }.getOrNull()
+            val same = if (unaborted != null) unaborted == transaction else {
+                // Normally the failed script left its own transaction aborted: only that one has the savepoint.
+                runCatching { execute(connection, "rollback to savepoint $savepoint") }.isSuccess &&
+                    runCatching { currentTransaction(connection) }.getOrNull() == transaction
+            }
+            if (same) throw error
+            // Another transaction, or one that can't be identified (aborted after COMMIT; BEGIN, or a lost connection).
+            scope.discard = true
+            throw ScriptFailedException(when {
+                unaborted != null -> "${endedTransaction(script)}; then it failed: ${describeFailure(error)}"
+                connectionLost(connection, error) ->
+                    "${script.fileName} failed because the connection to the database was lost while it ran (${describeFailure(error)}). " +
+                        "PostgreSQL rolls back a transaction that was not committed, so the script's changes were not kept (unless the " +
+                        "script ended SneakyDB's transaction itself) and its version was not recorded; check why the connection ended " +
+                        "(a database restart or failover, or pg_terminate_backend) before restarting"
+                else -> "${script.fileName} failed (${describeFailure(error)}), and SneakyDB could not confirm that it was still in the " +
+                    "transaction SneakyDB runs it in (a COMMIT or ROLLBACK in the script followed by BEGIN has this effect), so its " +
+                    "version was not recorded and the database may hold part of its changes; $CHECK_BY_HAND"
+            })
+        }
+        if (currentTransaction(connection) != transaction) {
+            // Session settings the script set before ending its transaction would survive; don't reuse the connection.
+            scope.discard = true
+            throw ScriptFailedException(endedTransaction(script))
+        }
+        execute(connection, "release savepoint $savepoint")
+        scope.checkActive()
+        // Session-level SET in a script would otherwise outlive it on this pooled connection.
+        execute(connection, "reset all")
+        connection.prepareStatement(
+            "insert into sneakydb.schema_migrations (plugin, version, name, checksum) values (?, ?, ?, ?)",
+        ).use { statement ->
+            statement.setString(1, step.plugin)
+            statement.setInt(2, script.version)
+            statement.setString(3, script.fileName)
+            statement.setString(4, script.checksum)
+            statement.executeUpdate()
+        }
+        return true
+    }
+
+    /** The server ended [connection] or it broke: SQL state class 08, 57P01–57P03, or the connection no longer answers. */
+    private fun connectionLost(connection: Connection, error: java.sql.SQLException): Boolean {
+        val state = error.sqlState.orEmpty()
+        return state.startsWith("08") || state in LOST_CONNECTION_STATES || !runCatching { connection.isValid(2) }.getOrDefault(false)
+    }
+
+    private fun endedTransaction(script: MigrationScript) =
+        "${script.fileName} ended the transaction SneakyDB runs it in (COMMIT, ROLLBACK or similar), so its version was not " +
+            "recorded and the database may hold part of its changes; $CHECK_BY_HAND"
+
+    private fun execute(connection: Connection, sql: String) = connection.createStatement().use { it.execute(sql) }
+
+    /** The id of the transaction [connection] is in; a script that ends its transaction makes the next call return another. */
+    private fun currentTransaction(connection: Connection): Long = single(connection, "select txid_current()") { it.getLong(1) }
+
+    /** Every row of the version table, by plugin. */
+    private fun readAll(connection: Connection): Map<String, List<AppliedVersion>> =
+        connection.prepareStatement("select plugin, version, checksum from sneakydb.schema_migrations").use { statement ->
+            statement.executeQuery().use { rows ->
+                val result = HashMap<String, MutableList<AppliedVersion>>()
+                while (rows.next()) result.getOrPut(rows.getString(1)) { mutableListOf() }.add(AppliedVersion(rows.getInt(2), rows.getString(3)))
+                result
+            }
+        }
+
+    /** Waits for the next migration lock of this database; released when the transaction ends. Not bound by lock_timeout. */
+    private fun lock(connection: Connection) {
+        connection.prepareStatement("select pg_advisory_xact_lock(?)").use {
+            it.setLong(1, MIGRATION_LOCK_KEY)
+            it.executeQuery().close()
+        }
+    }
+
+    private fun <T> single(connection: Connection, sql: String, vararg parameters: String, read: (java.sql.ResultSet) -> T): T =
+        connection.prepareStatement(sql).use { statement ->
+            parameters.forEachIndexed { index, value -> statement.setString(index + 1, value) }
+            statement.executeQuery().use { check(it.next()); read(it) }
+        }
+
+    /** Blocks the migration thread for [future] and rethrows its own failure, not a CompletionException around it. */
+    private fun <T> await(future: CompletableFuture<T>): T = try {
+        future.join()
+    } catch (error: CompletionException) {
+        throw error.cause ?: error
+    }
+}

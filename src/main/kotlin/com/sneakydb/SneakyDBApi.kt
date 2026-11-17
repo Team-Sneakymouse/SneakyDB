@@ -46,6 +46,20 @@ interface SneakyDBApi {
      */
     fun whenReady(): CompletableFuture<Void>
 
+    /**
+     * Registers [plugin]'s migration scripts; the future completes with the plugin's schema version once they are applied.
+     *
+     * [plugin] is the plugin's stable lower-case id (its `IDENTIFIER`, `[a-z][a-z0-9_]{0,62}`). The scripts are the files
+     * `db/migrations/V<number>__<name>.sql` in the jar (or class directory) that [anchor] was loaded from, numbered from 1
+     * without gaps. Call once per enable, during enable, and touch the plugin's tables only after the future completed.
+     * SneakyDB runs pending scripts once every plugin had its chance to register (first server tick on Paper, after
+     * proxy initialisation on Velocity), or at once for a later registration. The future fails with a message that says
+     * what to do when the scripts are invalid, the database is newer than the build, a script fails, a requirement on
+     * another plugin can't be met, or the database is unavailable. Completion callbacks may run on a SneakyDB thread.
+     */
+    fun migrate(plugin: String, anchor: Class<*>): CompletableFuture<Int> =
+        throw UnsupportedOperationException("This SneakyDB API does not support migrations")
+
     /** True after successful initialization until shutdown; not a health probe. */
     fun isAvailable(): Boolean
 

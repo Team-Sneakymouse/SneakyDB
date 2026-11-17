@@ -1,4 +1,4 @@
-# SneakyDB on Velocity. Same keys as the Paper config.yml `database:` section; copy the values over.
+# SneakyDB on Velocity. Same keys as the Paper config.yml `database:` and `migrations:` sections; copy the values over.
 # Read at proxy start; restart the proxy to apply edits. There is no maintenance section on a proxy.
 database:
   adapter: postgresql
@@ -9,3 +9,10 @@ database:
   password: change-me
   maximum-pool-size: 10
   connection-timeout-ms: 5000
+
+migrations:
+  # apply: run pending scripts. verify: never change the database; a plugin whose scripts are not all applied fails.
+  # Run apply on one server per database and verify on the others. Anything else than apply or verify means verify.
+  mode: apply
+  # How long a script waits for a table lock before it fails; clamped to 1–300 seconds.
+  lock-timeout-seconds: 10

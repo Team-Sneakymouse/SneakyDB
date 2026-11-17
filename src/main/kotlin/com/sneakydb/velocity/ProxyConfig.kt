@@ -1,6 +1,7 @@
 package com.sneakydb.velocity
 
 import com.sneakydb.DatabaseConfig
+import com.sneakydb.MigrationSettings
 import org.spongepowered.configurate.yaml.YamlConfigurationLoader
 import java.nio.file.Files
 import java.nio.file.Path
@@ -24,5 +25,11 @@ internal object ProxyConfig {
         }
         val database = YamlConfigurationLoader.builder().path(file).build().load().node("database")
         return DatabaseConfig.read { key -> database.node(key).raw() }
+    }
+
+    /** Reads the `migrations:` section of the file [load] made sure exists; absent keys take the Paper defaults. */
+    fun migrations(directory: Path, warn: (String) -> Unit): MigrationSettings {
+        val migrations = YamlConfigurationLoader.builder().path(directory.resolve(FILE)).build().load().node("migrations")
+        return MigrationSettings.read({ key -> migrations.node(key).raw() }, warn)
     }
 }
