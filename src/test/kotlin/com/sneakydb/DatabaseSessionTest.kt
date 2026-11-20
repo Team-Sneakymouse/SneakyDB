@@ -93,7 +93,17 @@ class DatabaseSessionTest {
             assertEquals("2", pool.dataSourceProperties.getProperty("connectTimeout"))
             assertEquals("2", pool.dataSourceProperties.getProperty("loginTimeout"))
             assertEquals(1250, pool.connectionTimeout)
+            assertEquals(2, pool.minimumIdle, "idle connections above minimum-idle are closed instead of kept forever")
+            assertEquals(com.sneakydb.adapter.IDLE_TIMEOUT_MS, pool.idleTimeout)
             assertFalse(pool.isRunning)
+        }
+    }
+
+    @Test fun `PostgreSQL adapter never keeps more idle connections than the pool holds`() {
+        val settings = com.sneakydb.adapter.DatabaseSettings("localhost", 5432, "test", "user", "secret", 3, 1250, minimumIdle = 8)
+        com.sneakydb.adapter.PostgreSqlAdapter().createDataSource(settings).use { pool ->
+            assertEquals(3, pool.minimumIdle)
+            assertEquals(3, pool.maximumPoolSize)
         }
     }
 

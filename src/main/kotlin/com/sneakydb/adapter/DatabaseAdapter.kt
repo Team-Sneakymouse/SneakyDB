@@ -16,7 +16,14 @@ data class DatabaseSettings(
     val password: String,
     val maximumPoolSize: Int,
     val connectionTimeoutMs: Long,
+    /** Idle connections the pool keeps open; it grows to [maximumPoolSize] under load and shrinks back when idle. */
+    val minimumIdle: Int = DEFAULT_MINIMUM_IDLE,
 )
+
+const val DEFAULT_MINIMUM_IDLE = 2
+
+/** How long a connection above [DatabaseSettings.minimumIdle] may sit idle before the pool closes it. */
+const val IDLE_TIMEOUT_MS = 600_000L
 
 class PostgreSqlAdapter : DatabaseAdapter {
     override val id = "postgresql"
@@ -28,6 +35,9 @@ class PostgreSqlAdapter : DatabaseAdapter {
         username = settings.username
         password = settings.password
         maximumPoolSize = settings.maximumPoolSize
+        // Hikari's default keeps the whole pool open forever; every server then holds maximumPoolSize connections.
+        minimumIdle = settings.minimumIdle.coerceIn(0, settings.maximumPoolSize)
+        idleTimeout = IDLE_TIMEOUT_MS
         connectionTimeout = settings.connectionTimeoutMs
         initializationFailTimeout = settings.connectionTimeoutMs
         // Bound the driver's initial network/login attempt as well as Hikari acquisition.

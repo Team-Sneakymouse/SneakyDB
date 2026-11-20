@@ -302,10 +302,11 @@ database:
   username: minecraft
   password: change-me
   maximum-pool-size: 10
+  minimum-idle: 2
   connection-timeout-ms: 5000
 ```
 
-Set credentials for your server before enabling the plugin. The file also has the `maintenance:` section (see [the fallback](#database-outage-maintenance-fallback)) and the `migrations:` section (see [Migrations for operators](#for-operators)). Database connection and query work runs on SneakyDB's worker threads; migration scripts run one at a time through the same workers and pool, from a `SneakyDB-Migrations` thread, and need no extra connection. The PostgreSQL driver and connection pool are bundled in the server jar.
+Set credentials for your server before enabling the plugin. The pool keeps `minimum-idle` connections open (default 2, clamped to 0–`maximum-pool-size`), opens more up to `maximum-pool-size` under load, and closes those again after 10 idle minutes, so a quiet server holds few connections on a database that many servers share. The file also has the `maintenance:` section (see [the fallback](#database-outage-maintenance-fallback)) and the `migrations:` section (see [Migrations for operators](#for-operators)). Database connection and query work runs on SneakyDB's worker threads; migration scripts run one at a time through the same workers and pool, from a `SneakyDB-Migrations` thread, and need no extra connection. The PostgreSQL driver and connection pool are bundled in the server jar.
 
 ## Database-outage maintenance fallback
 
@@ -342,6 +343,7 @@ database:
   username: minecraft
   password: change-me
   maximum-pool-size: 10
+  minimum-idle: 2
   connection-timeout-ms: 5000
 
 migrations:

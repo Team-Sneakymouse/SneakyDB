@@ -64,6 +64,7 @@ class ProxyConfigTest {
               username: proxy
               password: 1234
               maximum-pool-size: 500
+              minimum-idle: 99
               connection-timeout-ms: 10
         """.trimIndent())
         val config = ProxyConfig.load(directory, logged::add)
@@ -75,16 +76,22 @@ class ProxyConfigTest {
             assertEquals("proxy", username)
             assertEquals("1234", password)
             assertEquals(50, maximumPoolSize)
+            assertEquals(50, minimumIdle, "minimum-idle is clamped to the pool size")
             assertEquals(250, connectionTimeoutMs)
         }
         assertTrue(logged.isEmpty())
+    }
+
+    @Test fun `negative minimum-idle becomes zero`(@TempDir directory: Path) {
+        Files.writeString(directory.resolve("config.yml"), "database:\n  minimum-idle: -3\n")
+        assertEquals(0, ProxyConfig.load(directory, logged::add).settings.minimumIdle)
     }
 
     @Test fun `missing keys and section use defaults`(@TempDir directory: Path) {
         Files.writeString(directory.resolve("config.yml"), "other: true\n")
         val config = ProxyConfig.load(directory, logged::add)
         assertEquals("postgresql", config.adapterId)
-        assertEquals(com.sneakydb.adapter.DatabaseSettings("localhost", 5432, "minecraft", "minecraft", "", 10, 5000), config.settings)
+        assertEquals(com.sneakydb.adapter.DatabaseSettings("localhost", 5432, "minecraft", "minecraft", "", 10, 5000, minimumIdle = 2), config.settings)
     }
 
     @Test fun `malformed yaml throws`(@TempDir directory: Path) {

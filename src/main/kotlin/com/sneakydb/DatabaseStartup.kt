@@ -1,5 +1,6 @@
 package com.sneakydb
 
+import com.sneakydb.adapter.DEFAULT_MINIMUM_IDLE
 import com.sneakydb.adapter.DatabaseSettings
 import com.sneakydb.adapter.PostgreSqlAdapter
 import com.sneakydb.adapter.openPostgreSqlNotificationConnection
@@ -21,6 +22,7 @@ internal class DatabaseConfig(val adapterId: String, val settings: DatabaseSetti
             fun string(key: String, default: String) = value(key)?.toString() ?: default
             fun int(key: String, default: Int) = (value(key) as? Number)?.toInt() ?: default
             fun long(key: String, default: Long) = (value(key) as? Number)?.toLong() ?: default
+            val maximumPoolSize = int("maximum-pool-size", 10).coerceIn(1, 50)
             return DatabaseConfig(
                 adapterId = string("adapter", "postgresql").lowercase(),
                 settings = DatabaseSettings(
@@ -29,8 +31,9 @@ internal class DatabaseConfig(val adapterId: String, val settings: DatabaseSetti
                     database = string("name", "minecraft"),
                     username = string("username", "minecraft"),
                     password = string("password", ""),
-                    maximumPoolSize = int("maximum-pool-size", 10).coerceIn(1, 50),
+                    maximumPoolSize = maximumPoolSize,
                     connectionTimeoutMs = long("connection-timeout-ms", 5000).coerceIn(250, 30000),
+                    minimumIdle = int("minimum-idle", DEFAULT_MINIMUM_IDLE).coerceIn(0, maximumPoolSize),
                 ),
             )
         }

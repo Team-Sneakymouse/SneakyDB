@@ -8,6 +8,9 @@ database:
   username: minecraft
   password: change-me
   maximum-pool-size: 10
+  # Idle connections kept open; the pool opens more up to maximum-pool-size under load and closes them after
+  # 10 idle minutes. Clamped to 0–maximum-pool-size.
+  minimum-idle: 2
   connection-timeout-ms: 5000
 
 migrations:
